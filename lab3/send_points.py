@@ -51,6 +51,8 @@ class SendPoints(Node):
 		self.next_goal_index = 0
 		self.goal_points = [p for p in points]
 		self.last_distance = 1e30  # The last distance to goal from the callback
+		self.have_map = False
+		self.need_new_plan = True
 
 		# Parameters that hold the current state of the action client
 		#   You don't need to mess with these
@@ -193,8 +195,7 @@ class SendPoints(Node):
 	def completed_all_goals(self):
 		""" Returns True if all of the goals have been completed
 		GUIDE Use this to check if there are any goals left to do y/n"""
-		if self.next_goal_index > len(self.goal_points):
-			return True    # Went through all goals
+    		return self.next_goal_index >= len(self.goal_points)
 		
 	def add_more_goal_points(self, goal_pts: list):
 		""" Add more goal points; should be a list of tuples of x,y locations
@@ -202,7 +203,7 @@ class SendPoints(Node):
 		for pt in goal_pts:
 			self.goal_points.append(pt)
 
-		self._set_goal_markers()
+		self.start_timer.reset()
 
 		# This will kick start sending more goal points if it's stopped sending
 		if self._result_future == None:
@@ -455,6 +456,16 @@ class SendPoints(Node):
 
 		# GUIDE: Change this to get just the points you might consider looking at and perhaps don't do it every time a map is made
 		all_unseen_pts = find_all_possible_goals(im_thresh)  # Your exploring code
+		if len(all_unseen_pts) == 0:
+		    self.get_logger().info("No more goal points / exploration complete")
+		    return
+
+		if not self.have_map:
+		    self.have_map = True
+		    self.need_new_plan = True
+
+		if not self.need_new_plan and not self.completed_all_goals():
+		    return
 		reachable_pts = []
 		for p in all_unseen_pts:
 			map_xy = self.from_image_to_map(map_msg=map_msg, pt_uv=p)
@@ -476,7 +487,7 @@ class SendPoints(Node):
 		if 0 < goal_loc_in_image[0] < map_msg.info.width and 0 < goal_loc_in_image[1] < map_msg.info.height:
 			# Headed towards last goal and it is now in the free space of the robot
 			goal_loc_in_image = find_best_point(im_thresh, all_unseen_pts, robot_current_loc_in_image)  # Use your exploring code to find a good point
-			self.get_logger().info(f"Getting best {goal_loc_in_image} {is_free(im, goal_loc_in_image)}")
+			self.get_logger().info(f"Getting best {goal_loc_in_image} {is_free(im_thresh, goal_loc_in_image)}")
 		else:
 			# This just looks for the last viable goal (that is free) - will grab a goal
 			#  that's already been seen
@@ -513,9 +524,10 @@ class SendPoints(Node):
 
 		# GUIDE: This replaces the last goal if the robot has gone through the first two.
 		# THIS IS AN EXAMPLE of how to replace goal points. You can also use skip_current_goal and add_more_goal_points
-		if self.completed_all_goals():		
-			self.get_logger().info(f"Replacing way points with new ones {path_pts}")	
-			self.replace_goal_points(path_pts, False)
+		if len(path_pts) > 0:
+		    self.get_logger().info(f"Replacing way points with new ones {path_pts}")
+		    self.replace_goal_points(path_pts, False)
+		    self.need_new_plan = False
 
 
 # Unlike all the previous code, here we'll start up with a list of points to go to
