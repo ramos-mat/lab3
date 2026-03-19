@@ -476,15 +476,14 @@ class SendPoints(Node):
 		# GUIDE: Change this to get just the points you might consider looking at and perhaps don't do it every time a map is made
 		all_unseen_pts = find_all_possible_goals(im_thresh)  # Your exploring code
 		if len(all_unseen_pts) == 0:
-		    self.get_logger().info("No more goal points / exploration complete")
-		    return
+					self.get_logger().info("No more goal points / exploration complete")
+					return
 
+		# 2. Flag that we successfully processed our first map [cite: 53]
 		if not self.have_map:
-		    self.have_map = True
-		    self.need_new_plan = True
+					self.have_map = True
 
-		if not self.need_new_plan and not self.completed_all_goals():
-		    return
+		# 3. Convert unseen image pixels to map coordinates for RViz
 		reachable_pts = []
 		for p in all_unseen_pts:
 			map_xy = self.from_image_to_map(map_msg=map_msg, pt_uv=p)
@@ -565,10 +564,11 @@ class SendPoints(Node):
 
 		# GUIDE: This replaces the last goal if the robot has gone through the first two.
 		# THIS IS AN EXAMPLE of how to replace goal points. You can also use skip_current_goal and add_more_goal_points
+
 		if len(path_pts) > 0:
-		    self.get_logger().info(f"Replacing way points with new ones {path_pts}")
-		    self.replace_goal_points(path_pts, False)
-		    self.need_new_plan = False
+			self.get_logger().info(f"Replacing way points with new ones {path_pts}")
+			self.replace_goal_points(path_pts, False)
+			self.need_new_plan = False
 
 
 # Unlike all the previous code, here we'll start up with a list of points to go to
