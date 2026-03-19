@@ -424,64 +424,78 @@ class Lab3Driver(Node):
         #obs_turn isn't larger than max_turn
         obs_turn = float(max(-max_turn, min(max_turn, obs_turn_raw)))
 
+        cmd_v = 0.0
+        cmd_w = 0.0
+
         #if we're getting close enough, stop
         if self.close_enough():
             self.avoiding = False
             self.avoid_dir = 0
-            return self.zero_twist()
-        
-        #blocking check
-        blocking_margin = 0.05
-        blocking = obstacle_detected and (front_dist < self.target_dist)
-
-        #if blocking iand not avoiding, start avoiding
-        if blocking and not self.avoiding:
-            self.avoiding = True
-            # choose direction
-            if abs(left_dist - right_dist) < 0.12:
-            # if similar don't go to the obstacle!! pleaseeee
-                self.avoid_dir = 1 if (left_dist >= right_dist) else -1
-            else:
-                self.avoid_dir = 1 if (left_dist > right_dist) else -1
-
-        #if not blocking and not in avoiding state, normal behavior
-        if self.avoiding:
-            release_clear_dist = 0.6
-            if front_dist > release_clear_dist and min(left_dist, right_dist) > 0.55:
-                self.avoiding = False
-                self.avoid_dir = 0
-            else:
-                t.twist.linear.x = float(self.avoid_speed)
-                t.twist.angular.z = float(max(-max_turn, min(max_turn, self.avoid_turn_bias * self.avoid_dir)))
-                return t
-
-        #safe stop: if something is close stop and turn
-        safe_stop = 0.7  # meters
-        if front_dist < safe_stop:
-            # force avoidance state
-            self.avoiding = True
-            # set avoid_dir if unknown
-            if self.avoid_dir == 0:
-                self.avoid_dir = 1 if (left_dist > right_dist) else -1
-            t.twist.linear.x = 0.0
-            t.twist.angular.z = float(max(-max_turn, min(max_turn, self.avoid_turn_bias * self.avoid_dir)))
-            return t
-
-        #normal navigation
-        turn = max(-max_turn, min(max_turn, angle))
-        t.twist.angular.z = float(turn)
-
-        #allow forward motion if target is in front
-        angle_threshold_for_foward = 1.0 #radians
-        if abs(angle) < angle_threshold_for_foward:
-            t.twist.linear.x = float(speed)
+            cmd_v = 0.0
+            cmd_w = 0.0
         else:
-            t.twist.linear.x = 0.05
+            #blocking check
+            blocking_margin = 0.05
+            blocking = obstacle_detected and (front_dist < self.target_dist)
+
+            #if blocking iand not avoiding, start avoiding
+            if blocking and not self.avoiding:
+                self.avoiding = True
+                # choose direction
+                if abs(left_dist - right_dist) < 0.12:
+                # if similar don't go to the obstacle!! pleaseeee
+                    self.avoid_dir = 1 if (left_dist >= right_dist) else -1
+                else:
+                    self.avoid_dir = 1 if (left_dist > right_dist) else -1
+
+            #if not blocking and not in avoiding state, normal behavior
+            if self.avoiding:
+                release_clear_dist = 0.6
+                if front_dist > release_clear_dist and min(left_dist, right_dist) > 0.55:
+                    self.avoiding = False
+                    self.avoid_dir = 0
+                else:
+                    cmd_v = float(self.avoid_speed)
+                    cmd_w = float(max(-max_turn, min(max_turn, self.avoid_turn_bias * self.avoid_dir)))
+
+            if not self.avoiding:
+                #safe stop: if something is close stop and turn
+                safe_stop = 0.7  # meters
+                if front_dist < safe_stop:
+                    # force avoidance state
+                    self.avoiding = True
+                    # set avoid_dir if unknown
+                    if self.avoid_dir == 0:
+                        self.avoid_dir = 1 if (left_dist > right_dist) else -1
+                    cmd_v = 0.0
+                    cmd_w = float(max(-max_turn, min(max_turn, self.avoid_turn_bias * self.avoid_dir)))
+                else:
+                    #normal navigation
+                    turn = max(-max_turn, min(max_turn, angle))
+                    cmd_w = float(turn)
+
+                    #allow forward motion if target is in front
+                    angle_threshold_for_foward = 1.0 #radians
+                    if abs(angle) < angle_threshold_for_foward:
+                        cmd_v = float(speed)
+                    else:
+                        cmd_v = 0.05
+
+        final_linear_x = self.alpha * cmd_v + (1 - self.alpha) * self.prev_linear_x
+        final_angular_z = self.alpha * cmd_w + (1 - self.alpha) * self.prev_angular_z
+
+        # Save current smoothed commands for the next frame
+        self.prev_linear_x = final_linear_x
+        self.prev_angular_z = final_angular_z
+
+        # Assign to the actual twist message
+        t.twist.linear.x = float(final_linear_x)
+        t.twist.angular.z = float(final_angular_z)
 
         if self.print_twist_messages:
             self.get_logger().info(f"Setting twist forward {t.twist.linear.x} angle {t.twist.angular.z}")
-            
-        return t            
+        
+        return t 
 
 
 # The idiom in ROS2 is to use a function to do all of the setup and work.  This
