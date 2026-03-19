@@ -195,7 +195,7 @@ class SendPoints(Node):
 	def completed_all_goals(self):
 		""" Returns True if all of the goals have been completed
 		GUIDE Use this to check if there are any goals left to do y/n"""
-    		return self.next_goal_index >= len(self.goal_points)
+		return self.next_goal_index >= len(self.goal_points)
 		
 	def add_more_goal_points(self, goal_pts: list):
 		""" Add more goal points; should be a list of tuples of x,y locations
@@ -521,17 +521,37 @@ class SendPoints(Node):
 		#  Note: If you did not fix your code to deal with an unreachable point then this will handle that case
 		#   as an exception
 		path_pts = []
+		#bounds check
+		def in_bounds(im, p):
+			return 0 <= p[0] < im.shape[1] and 0 <= p[1] < im.shape[0]
+		
+		if not in_bounds(im_thresh, robot_current_loc_in_image):
+			self.get_logger().info("Robot out of bounds, skipping this cycle")
+			return
+		if not in_bounds(im_thresh, goal_loc_in_image):
+			self.get_logger().info("Goal out of bounds, skipping goal")
+			self.skip_current_goal()
+			return
 		try:
 			path = dijkstra(im_thresh, robot_current_loc_in_image, goal_loc_in_image)
 			self.get_logger().info(f"Path {path}")	
 			path_waypoints = find_waypoints(im_thresh, path)
-			self.get_logger().info(f"Path waypoints {path_waypoints}")	
+			self.get_logger().info(f"Path waypoints {path_waypoints}")
+
+			#skip if path is too short (unreachable or nonsense)
+			if len(path_waypoints) < 2:
+				self.get_logger().info("Path too short, skipping goal")
+				self.skip_current_goal()
+				return
+			
 			for p in path_waypoints:
 				map_xy = self.from_image_to_map(map_msg=map_msg, pt_uv=p)
 				path_pts.append(map_xy)
 			self._set_path_markers(path_pts, 1)
 		except IndexError:
-			self.get_logger().info("Robot or goal location not in image map")
+			self.get_logger().info("Robot or goal location not in image map, skipping")
+			self.skip_current_goal()
+			return
 		except ValueError:
 			if is_free(im_thresh, robot_current_loc_in_image):
 				if is_free(im_thresh, goal_loc_in_image):
@@ -540,6 +560,8 @@ class SendPoints(Node):
 					self.get_logger().info(f"Goal not free {robot_current_loc_in_image} to {goal_loc_in_image}")
 			else:
 				self.get_logger().info(f"Robot starting location not free {robot_current_loc_in_image}")
+			self.skip_current_goal()
+			return
 
 		# GUIDE: This replaces the last goal if the robot has gone through the first two.
 		# THIS IS AN EXAMPLE of how to replace goal points. You can also use skip_current_goal and add_more_goal_points
