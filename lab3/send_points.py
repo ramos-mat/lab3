@@ -155,8 +155,8 @@ class SendPoints(Node):
 			self.start_timer.reset()  # Increment to the next goal	
 		else:
 			# GUIDE: This is where you should flag if you want to bail on the current set of goals
-			# entirely or just skip to the next one
-			self.get_logger().info(f"Did not get to goal, skipping {self.next_goal_index}")
+			self.get_logger().info(f"Did not get to goal {self.next_goal_index}. Replanning.")
+			self.need_new_plan = True # Force a replan on the next map update
 
 		self._send_goal_future = None
 		self._result_future = None
@@ -454,6 +454,25 @@ class SendPoints(Node):
 		robot_current_loc_in_image = self.from_map_to_image(map_msg=map_msg, pt_xy=robot_current_loc_in_map)
 		self.get_logger().info(f"Robot current location {robot_current_loc_in_map}")
 
+		# Condition 1: We finished our current list of goals
+		if self.completed_all_goals():
+			self.need_new_plan = True
+
+		# Condition 2: Check if our current active goal just became a wall or was explored
+		if not self.completed_all_goals() and len(self.goal_points) > 0:
+			if self.next_goal_index < len(self.goal_points):
+				current_active_goal = self.goal_points[self.next_goal_index]
+				current_active_goal_uv = self.from_map_to_image(map_msg=map_msg, pt_xy=current_active_goal)
+				
+				# If it's no longer free, we need to bail and replan
+				if not is_free(im_thresh, current_active_goal_uv):
+					self.get_logger().info("Current goal is no longer free! Replanning...")
+					self.need_new_plan = True
+					self.skip_current_goal() # Cancel the bad goal in the driver
+					
+		if not self.need_new_plan:
+			return 
+			
 		# GUIDE: Change this to get just the points you might consider looking at and perhaps don't do it every time a map is made
 		all_unseen_pts = find_all_possible_goals(im_thresh)  # Your exploring code
 		if len(all_unseen_pts) == 0:
