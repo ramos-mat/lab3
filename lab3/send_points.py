@@ -2,8 +2,8 @@
 
 # Bill Smart, smartw@oregonstate.edu
 #
-# send_points.py
-# Send navigation targets to the robot
+# driver.py
+# Drive the robot towards a goal, going around an object
 
 
 # Every Python node in ROS2 should include these lines.  rclpy is the basic Python
@@ -11,588 +11,593 @@
 import rclpy
 from rclpy.node import Node
 
+# Velocity commands are given with Twist messages, from geometry_msgs
+from geometry_msgs.msg import Twist, PoseStamped
+
+# math stuff
+from math import atan2, tanh, sqrt, pi, fabs, cos, sin
 import numpy as np
 
-from threading import Lock
+# Header for the twist message
+from std_msgs.msg import Header
 
-from geometry_msgs.msg import PointStamped, Point
-from visualization_msgs.msg import Marker, MarkerArray
-from rclpy.action import ActionClient
-from rclpy.action.client import ClientGoalHandle
+# The twist command and the goal
+from geometry_msgs.msg import TwistStamped, PointStamped
+
+# For publishing markers to rviz
+from visualization_msgs.msg import Marker
+
+# The laser scan message type
+from sensor_msgs.msg import LaserScan
+
+# These are all for setting up the action server/client
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.action import ActionServer, CancelResponse, GoalResponse
+from rclpy.action.server import ServerGoalHandle
+
+# This is the format of the message sent by the client - it is another node under lab 2
 from nav_targets.action import NavTarget
-from rclpy.executors import MultiThreadedExecutor
-from rclpy.task import Future
-from nav_msgs.msg import OccupancyGrid
 
 # These are for transforming points/targets in the world into a point in the robot's coordinate space
 from tf2_ros.transform_listener import TransformListener
 from tf2_ros.buffer import Buffer
+from tf2_geometry_msgs import do_transform_point
 
-# Your path planning
-from lab3.path_planning import dijkstra, is_free
-from lab3.exploring import find_all_possible_goals, find_best_point, find_waypoints
+# This sets up multi-threading so the laser scan can happen at the same time we're processing the target goal
+from rclpy.executors import MultiThreadedExecutor
 
 
-class SendPoints(Node):
-	def __init__(self, points):
-		""" Initialize way points
-		@param - points, an iterable list of x,y tuples"""
-		# Initialize the parent class, giving it a name.  The idiom is to use the
-		# super() class.
-		super().__init__('send_points')
+class Lab3Driver(Node):
+    def __init__(self, threshold=0.1):
+        """ We have parameters this time
+        @param threshold - how close do you have to be before saying you're at the goal? Set to width of robot
+        """
+        # Initialize the parent class, giving it a name.  The idiom is to use the
+        # super() class.
+        super().__init__('driver')
 
-		# A mutex to keep us safe during the list deletions.
-		self.mutex = Lock()
+        # Goal will be set later. The action server will set the goal; you don't set it directly
+        self.goal = None
+        # A controllable parameter for how close you have to be to the goal to say "I'm there"
+        self.threshold = threshold
 
-		# An action server to send the requests to.
-		self.action_client = ActionClient(node=self, action_type=NavTarget, action_name='nav_target')
+        # Make a Marker to put in RViz to show the current goal/target the robot is aiming for
+        self.target_marker = None
 
-		# Save the goal points for when we start up the action client/server
-		self.next_goal_index = 0
-		self.goal_points = [p for p in points]
-		self.last_distance = 1e30  # The last distance to goal from the callback
-		self.have_map = False
-		self.need_new_plan = True
+        # Publisher before subscriber
+        self.cmd_pub = self.create_publisher(TwistStamped, 'cmd_vel', 1)
+        # Publish the current target as a marker (so RViz can show it)
+        self.target_pub = self.create_publisher(Marker, 'current_target', 1)
 
-		# Parameters that hold the current state of the action client
-		#   You don't need to mess with these
-		self._goal_handle = None
-		self._send_goal_future = None
-		self._result_future = None
-		self._cancel_future = None
+        # Subscriber after publisher; this is the laser scan
+        self.sub = self.create_subscription(LaserScan, 'base_scan', self.scan_callback, 10)
 
-		# Subscriber after publisher; this is the map
-		self.map_subscriber = self.create_subscription(
-            OccupancyGrid,
-            '/map',  # topic name
-            self.map_callback,
-            10
-        )
-
-		# Create a buffer to put the transform data in
-		self.tf_buffer = Buffer()
+        # Create a buffer to put the transform data in
+        self.tf_buffer = Buffer()
         
-		# This sets up a listener for all of the transform types created
-		self.transform_listener = TransformListener(self.tf_buffer, self)
-		
-		# Timer to make sure we publish the target marker and start the goal sending
-		self.start_timer = self.create_timer(1.0, self._start_action_client)
-
-		# Three sets of markers - one for the goal points, one for reachable points, one for path points
-		#    The last two are for you to use when getting paths/reachable points from the map
-		#    Do not set these directly - use set_xxx methods
-		self.goal_markers = None
-		self.path_markers = None
-		self.reachable_markers = None
-
-		# Publishers for the RViz visualization
-		self.goal_marker_pub = self.create_publisher(MarkerArray, 'goal_points', 1)
-		self.path_marker_pub = self.create_publisher(MarkerArray, 'path_points', 1)
-		self.reachable_marker_pub = self.create_publisher(MarkerArray, 'reachable_points', 1)
-
-
-	def _start_action_client(self):
-		""" This gets called by the timer whenever a new set of goals needs to be kicked off"""
-
-		# Cancel the timer - we're starting
-		self.start_timer.cancel()
-
-		if self.next_goal_index == 0:
-			# Wait for driver to start
-			self.get_logger().info("Start driver.py to get started")
-			self.action_client.wait_for_server()
-		
-		# Run out of goal points
-		if self.next_goal_index >= len(self.goal_points):
-			self.next_goal_index += 1
-			self.get_logger().info("No more points to send")
-			return
-			
-		if self.next_goal_index == 0:
-			# First time through - make the marker points and publish them
-			#. NOTE: You should call _set_goal_markers() anytime you change points()
-			self._set_goal_markers()
-
-		# send the next goal
-		pt = self.goal_points[self.next_goal_index]
-		self.next_goal_index += 1
-
-		# Create the goal point in the world coordinate frame
-		goal = NavTarget.Goal()
-		goal.goal.header.frame_id = 'odom'
-		goal.goal.header.stamp = self.get_clock().now().to_msg()
-
-		goal.goal.point.x = float(pt[0])
-		goal.goal.point.y = float(pt[1])
-		goal.goal.point.z = 0.0
-
-		self.get_logger().info(f'Sending goal request... {self.next_goal_index-1} of {len(self.goal_points)} {pt[0], pt[1]}')
-
-		# Send the driver the message that we're ready to send a goal point
-		self._send_goal_future: Future = self.action_client.send_goal_async(goal=goal, 
-														                    feedback_callback=self._feedback_callback)
-		# This sets the call back for when the driver says it got the goal request 
-		self._send_goal_future.add_done_callback(self._goal_sent_callback)
-
-	def _goal_sent_callback(self, future : Future):
-		""" This gets called when the server says I got the goal
-		@param future - communicate with the server"""
-
-		self._goal_handle: ClientGoalHandle = future.result()
-		if not self._goal_handle.accepted:
-			self.warn(f"{self.get_name()}: Action server not available; did you kill driver.py?")
-		else:
-			self.get_logger().info(f"Goal accepted")
-			# Add a callback for the actual driver executing the goal
-			self._result_future: Future = self._goal_handle.get_result_async()
-			self._result_future.add_done_callback(self._goal_done_callback)
-
-	def _goal_done_callback(self, future : Future):
-		""" This gets called when the server says I finished the goal"""
-		result: NavTarget.Result = future.result().result
-		if result.success:
-			self.get_logger().info(f"Got to goal {self.next_goal_index}, moving to next")
-			self.start_timer.reset()  # Increment to the next goal	
-		else:
-			# GUIDE: This is where you should flag if you want to bail on the current set of goals
-			self.get_logger().info(f"Did not get to goal {self.next_goal_index}. Replanning.")
-			self.need_new_plan = True # Force a replan on the next map update
-
-		self._send_goal_future = None
-		self._result_future = None
-		self._cancel_future = None
-
-	def _feedback_callback(self, feedback):
-		"""Every time driver loops in the action callback it send back the distance to the target as feedbackack
-		@param feedback - data created by the action server - this has the distance in it (as a float)"""
-		
-		# Right now not doing anything but publishing the current distance
-		
-		self.last_distance = feedback.feedback.distance.data
-		self.get_logger().info(f'Feedback: Distance: {feedback.feedback.distance.data}')
-
-	def _cancel_response_callback(self, future : Future):
-		""" This is a call and response to the server to check that it actually canceled the goal"""
-		cancel_response = future.result()
-		self.start_timer.reset()  # Increment to the next goal (if there is one)
-		self.get_logger().info(f'Cancel request accepted by server: {cancel_response.return_code}')
-		self._send_goal_future = None
-		self._result_future = None
-		self._cancel_future = None
-
-	def skip_current_goal(self):
-		""" Cancels the current goal and moves to the next (if any)
-		GUIDE: Use this to skip over the current goal. Do NOT call repeatedly - it takes a while to process"""
-		if not self._goal_handle:
-			self.get_logger().info(f"No active goals to skip")
-		elif self._cancel_future:
-			self.get_logger().info(f"Already skipping goal, wait for this to finish before skipping next")
-		else:
-			self.get_logger().info(f"Skipping to next goal {self.next_goal_index} of {len(self.goal_points)}")
-			self._cancel_future = self._goal_handle.cancel_goal_async()
-			self._cancel_future.add_done_callback(self._cancel_response_callback)
-
-	def completed_all_goals(self):
-		""" Returns True if all of the goals have been completed
-		GUIDE Use this to check if there are any goals left to do y/n"""
-		return self.next_goal_index >= len(self.goal_points)
-		
-	def add_more_goal_points(self, goal_pts: list):
-		""" Add more goal points; should be a list of tuples of x,y locations
-		GUIDE: Use this if you just want to append more goals to the current list"""
-		for pt in goal_pts:
-			self.goal_points.append(pt)
-
-		self.start_timer.reset()
-
-		# This will kick start sending more goal points if it's stopped sending
-		if self._result_future == None:
-			self.start_timer().reset()   # Increment to the next goal
-	
-	def replace_goal_points(self, goal_pts: list, skip_current: bool):
-		""" Replace the current list of goal points, and, optionally, skip the current
-		@param goal_pts: a list of tuples of x,y locations
-		@param skip_current: Will call skip-current for you after setting up new goals"""
-		self.next_goal_index = 0
-
-		# Just doing this to make sure the points you pass in are in the correct form
-		self.goal_points = []
-		for p in goal_pts:
-			self.goal_points.append((p[0], p[1]))
-		
-		if skip_current:
-			self.skip_current_goal()
-
-		self._set_goal_markers()
-		# This will kick start sending more goal points if it's stopped sending
-		if self._result_future == None:
-			self.start_timer.reset()   # Increment to the next goal
-
-	def _set_goal_markers(self):
-		""" Update the goal markers whenever the goals change"""
-		if self.goal_markers == None:
-			self.goal_markers = MarkerArray()
-
-		# Lock while we make the Marker Array
-		with self.mutex:
-			line_marker = Marker()
-			line_marker.header.frame_id = 'odom'
-			line_marker.header.stamp = self.get_clock().now().to_msg()
-			line_marker.type = Marker.LINE_STRIP
-			line_marker.action = Marker.ADD
-			line_marker.id = 0
-			line_marker.scale.x = 0.1
-			line_marker.scale.y = 0.1
-			line_marker.scale.z = 0.1
-			line_marker.color.r = 0.0
-			line_marker.color.g = 0.0
-			line_marker.color.b = 1.0
-			line_marker.color.a = 1.0
-			line_marker.points = []
-			for p in self.goal_points:
-				pt = Point()
-				pt.x = p[0]
-				pt.y = p[1]
-				pt.z = 0.0
-				line_marker.points.append(pt)
-			
-			# Make the line(s) between the markers
-			self.goal_markers.markers = []
-			self.goal_markers.markers.append(line_marker)
-
-			# Make the dots for the markers
-			for indx, point in enumerate(self.goal_points):
-				marker = Marker()
-				marker.header.frame_id = 'odom'
-				marker.header.stamp = self.get_clock().now().to_msg()
-				marker.id = line_marker.id + indx + 1
-				marker.type = Marker.SPHERE
-				marker.action = Marker.ADD
-				marker.pose.position.x = point[0]
-				marker.pose.position.y = point[1]
-				marker.pose.position.z = 0.0
-				marker.pose.orientation.x = 0.0
-				marker.pose.orientation.y = 0.0
-				marker.pose.orientation.z = 0.0		
-				marker.pose.orientation.w = 1.0
-				marker.scale.x = 0.2
-				marker.scale.y = 0.2
-				marker.scale.z = 0.2
-				marker.color.r = 0.0
-				marker.color.g = 0.0
-				marker.color.b = 1.0
-				marker.color.a = 1.0
-
-				self.goal_markers.markers.append(marker)
-
-		# Actually publish the list
-		self.goal_marker_pub.publish(self.goal_markers)
-
-	def _set_path_markers(self, path_list, skip=5):
-		"""Update the path markers. Assumes path_list is a list of tuple x,y locations
-		@param path_list - param list of tuples with x,y locations in map coordinate frame
-		@param skip draw ever nth one"""
-		if self.path_markers == None:
-			self.path_markers = MarkerArray()
-
-		# Lock while we make the Marker Array
-		with self.mutex:
-			line_marker = Marker()
-			line_marker.header.frame_id = 'odom'
-			line_marker.header.stamp = self.get_clock().now().to_msg()
-			line_marker.type = Marker.LINE_STRIP
-			line_marker.action = Marker.ADD
-			line_marker.id = 10000
-			line_marker.scale.x = 0.1
-			line_marker.scale.y = 0.1
-			line_marker.scale.z = 0.1
-			line_marker.color.r = 1.0
-			line_marker.color.g = 1.0
-			line_marker.color.b = 0.0
-			line_marker.color.a = 1.0
-			line_marker.points = []
-			for p in path_list[0::skip]:
-				pt = Point()
-				pt.x = p[0]
-				pt.y = p[1]
-				pt.z = 0.0
-				line_marker.points.append(pt)
-			
-			# Make the line(s) between the markers
-			self.path_markers.markers = []
-			self.path_markers.markers.append(line_marker)
-
-			# Make the dots for the markers
-			for indx, point in enumerate(path_list[0::skip]):
-				marker = Marker()
-				marker.header.frame_id = 'odom'
-				marker.header.stamp = self.get_clock().now().to_msg()
-				marker.id = line_marker.id + indx + 1
-				marker.type = Marker.SPHERE
-				marker.action = Marker.ADD
-				marker.pose.position.x = point[0]
-				marker.pose.position.y = point[1]
-				marker.pose.position.z = 0.0
-				marker.pose.orientation.x = 0.0
-				marker.pose.orientation.y = 0.0
-				marker.pose.orientation.z = 0.0		
-				marker.pose.orientation.w = 1.0
-				marker.scale.x = 0.2
-				marker.scale.y = 0.2
-				marker.scale.z = 0.2
-				marker.color.r = 1.0
-				marker.color.g = 1.0
-				marker.color.b = 0.0
-				marker.color.a = 1.0
-
-				self.path_markers.markers.append(marker)
-				
-		# Actually publish the list
-		self.path_marker_pub.publish(self.path_markers)
-
-	def _set_reachable_markers(self, points):
-		""" Put markers on the reachable points
-		@param points - list of x,y tuples in map space"""
-
-		if self.reachable_markers == None:
-			self.reachable_markers = MarkerArray()
-
-		# Lock while we make the Marker Array
-		with self.mutex:
-			self.reachable_markers.markers = []
-
-			# Make the dots for the markers
-			for indx, point in enumerate(points):
-				marker = Marker()
-				marker.header.frame_id = 'odom'
-				marker.header.stamp = self.get_clock().now().to_msg()
-				marker.id = 10000 + indx + 1
-				marker.type = Marker.SPHERE
-				marker.action = Marker.ADD
-				marker.pose.position.x = point[0]
-				marker.pose.position.y = point[1]
-				marker.pose.position.z = 0.0
-				marker.pose.orientation.x = 0.0
-				marker.pose.orientation.y = 0.0
-				marker.pose.orientation.z = 0.0		
-				marker.pose.orientation.w = 1.0
-				marker.scale.x = 0.05
-				marker.scale.y = 0.05
-				marker.scale.z = 0.05
-				marker.color.r = 0.0
-				marker.color.g = 1.0
-				marker.color.b = 0.5
-				marker.color.a = 1.0
-
-				self.reachable_markers.markers.append(marker)
-				
-		# Actually publish the list
-		self.reachable_marker_pub.publish(self.reachable_markers)
-
-	def set_marker_points(self):
-		"""Publishes the points in the list and links them up so they'll show up in RViz"""
-		self._set_goal_markers()
-
-	def from_map_to_image(self, map_msg : OccupancyGrid, pt_xy = (0.0, 0.0)):
-		""" Convert from a point in the image to a point in the world
-		@param map_msg - the map
-		@param pt_xy - a tuple with an x,y in it
-		@return pt_uv - point in the image"""
-		info = map_msg.info
-
-		im_u = 0
-		im_v = 0
-
-		# GUIDE: Subtract the origin position of the map and then divide by the resolution
-		#   Don't forget to cast to an int
-  # YOUR CODE HERE
-		im_u = int((pt_xy[0] - info.origin.position.x) / info.resolution)
-		im_v = int((pt_xy[1] - info.origin.position.y) / info.resolution)
-		# self.get_logger().info(f"before {pt_xy} after {im_u}, {im_v}")
-		return (im_u, im_v)
-			
-	def from_image_to_map(self, map_msg : OccupancyGrid, pt_uv = (0, 0)):
-		""" Convert from a point in the world to a point in the image
-		@param map_msg - the map
-		@param pt_uv - a tuple with a u,v in width/height in it
-		@return pt_xy - point in the world"""
-		info = map_msg.info
-
-		pt_x = 0.0
-		pt_y = 0.0
-		# GUIDE: Multiply by the resolution then add the origin position of the map 
-  # YOUR CODE HERE
-		# self.get_logger().info(f"before {pt_uv} after {pt_x}, {pt_y}")
-		pt_x = pt_uv[0] * info.resolution + info.origin.position.x
-		pt_y = pt_uv[1] * info.resolution + info.origin.position.y
-		return (pt_x, pt_y)
-
-	def map_callback(self, map_msg : OccupancyGrid):
-		""" Called when the map gets updated. Size etc of the map is in the message"""
-		self.get_logger().info(f"Got map size {(map_msg.info.width, map_msg.info.height)}, resolution {map_msg.info.resolution}")
-		self.get_logger().info(f" Origin origin {map_msg.info.origin.position}")
-
-	    # msg.data is a flat list of int8 values (-1 for unknown, 0 free, 100 occupied)
-		im = np.array(map_msg.data, dtype=np.int8)
-
-		# Reshape to (height, width)
-		im = im.reshape((map_msg.info.height, map_msg.info.width))
-
-		im_thresh = np.zeros(im.shape, dtype=np.uint8)
-
-		# Threshold image
-		im_thresh[im < 10] = 255    # Free
-		im_thresh[im >= 100] = 0    # Wall
-		im_thresh[im == -1] = 128   # Unknown
-
-		self.get_logger().info(f"N free {np.count_nonzero(im_thresh == 255)}, N walls {np.count_nonzero(im_thresh == 0)}, N {np.count_nonzero(im_thresh == 128)}")
-
-
-		# Location of robot
-		transform = self.tf_buffer.lookup_transform('odom', 'base_link', rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=1.0))
-		robot_current_loc_in_map = (transform.transform.translation.x, transform.transform.translation.y)
-		robot_current_loc_in_image = self.from_map_to_image(map_msg=map_msg, pt_xy=robot_current_loc_in_map)
-		self.get_logger().info(f"Robot current location {robot_current_loc_in_map}")
-
-		# Condition 1: We finished our current list of goals
-		if self.completed_all_goals():
-			self.need_new_plan = True
-
-		# Condition 2: Check if our current active goal just became a wall or was explored
-		if not self.completed_all_goals() and len(self.goal_points) > 0:
-			if self.next_goal_index < len(self.goal_points):
-				current_active_goal = self.goal_points[self.next_goal_index]
-				current_active_goal_uv = self.from_map_to_image(map_msg=map_msg, pt_xy=current_active_goal)
-				
-				# If it's no longer free, we need to bail and replan
-				if not is_free(im_thresh, current_active_goal_uv):
-					self.get_logger().info("Current goal is no longer free! Replanning...")
-					self.need_new_plan = True
-					self.skip_current_goal() # Cancel the bad goal in the driver
-					
-		if not self.need_new_plan:
-			return 
-			
-		# GUIDE: Change this to get just the points you might consider looking at and perhaps don't do it every time a map is made
-		all_unseen_pts = find_all_possible_goals(im_thresh)  # Your exploring code
-		if len(all_unseen_pts) == 0:
-					self.get_logger().info("No more goal points / exploration complete")
-					return
-
-		# 2. Flag that we successfully processed our first map [cite: 53]
-		if not self.have_map:
-					self.have_map = True
-
-		# 3. Convert unseen image pixels to map coordinates for RViz
-		reachable_pts = []
-		for p in all_unseen_pts:
-			map_xy = self.from_image_to_map(map_msg=map_msg, pt_uv=p)
-			reachable_pts.append(map_xy)
-
-		# This puts markers in RViz for all unseen points
-		self._set_reachable_markers(reachable_pts)
-
-		# GUIDE: This is currently set up to call path planning every iteration (which is probably not what you want)
-		#   If we're on the way to the current goal, path plan to the closest goal point that is reachable
-		#   If we're headed towards the last goal, get a goal from best_pt
-
-		# The final goal point in image coords
-		if len(self.goal_points) > 0:		
-			goal_loc_in_image = self.from_map_to_image(map_msg=map_msg, pt_xy=self.goal_points[-1])
-		else:
-			goal_loc_in_image = (map_msg.info.width // 2, map_msg.info.height // 2)
-
-		if 0 < goal_loc_in_image[0] < map_msg.info.width and 0 < goal_loc_in_image[1] < map_msg.info.height:
-			# Headed towards last goal and it is now in the free space of the robot
-			goal_loc_in_image = find_best_point(im_thresh, all_unseen_pts, robot_current_loc_in_image)  # Use your exploring code to find a good point
-			self.get_logger().info(f"Getting best {goal_loc_in_image} {is_free(im_thresh, goal_loc_in_image)}")
-		else:
-			# This just looks for the last viable goal (that is free) - will grab a goal
-			#  that's already been seen
-			if self.goal_points:
-				for p in self.goal_points:
-					try_goal_loc_in_image = self.from_map_to_image(map_msg=map_msg, pt_xy=p)
-					if try_goal_loc_in_image[0] < map_msg.info.width and try_goal_loc_in_image[1] < map_msg.info.height:
-						if is_free(im_thresh, try_goal_loc_in_image):
-							goal_loc_in_image = try_goal_loc_in_image
-
-		# GUIDE: This calls dijkstra with the goal location and plots the path that you return in RViz
-		#  Note: If you did not fix your code to deal with an unreachable point then this will handle that case
-		#   as an exception
-		path_pts = []
-		#bounds check
-		def in_bounds(im, p):
-			return 0 <= p[0] < im.shape[1] and 0 <= p[1] < im.shape[0]
-		
-		if not in_bounds(im_thresh, robot_current_loc_in_image):
-			self.get_logger().info("Robot out of bounds, skipping this cycle")
-			return
-		if not in_bounds(im_thresh, goal_loc_in_image):
-			self.get_logger().info("Goal out of bounds, skipping goal")
-			self.skip_current_goal()
-			return
-		try:
-			path = dijkstra(im_thresh, robot_current_loc_in_image, goal_loc_in_image)
-			self.get_logger().info(f"Path {path}")	
-			path_waypoints = find_waypoints(im_thresh, path)
-			self.get_logger().info(f"Path waypoints {path_waypoints}")
-
-			#skip if path is too short (unreachable or nonsense)
-			if len(path_waypoints) < 2:
-				self.get_logger().info("Path too short, skipping goal")
-				self.skip_current_goal()
-				return
-			
-			for p in path_waypoints:
-				map_xy = self.from_image_to_map(map_msg=map_msg, pt_uv=p)
-				path_pts.append(map_xy)
-			self._set_path_markers(path_pts, 1)
-		except IndexError:
-			self.get_logger().info("Robot or goal location not in image map, skipping")
-			self.skip_current_goal()
-			return
-		except ValueError:
-			if is_free(im_thresh, robot_current_loc_in_image):
-				if is_free(im_thresh, goal_loc_in_image):
-					self.get_logger().info(f"No valid path {robot_current_loc_in_image} to {goal_loc_in_image}")
-				else:
-					self.get_logger().info(f"Goal not free {robot_current_loc_in_image} to {goal_loc_in_image}")
-			else:
-				self.get_logger().info(f"Robot starting location not free {robot_current_loc_in_image}")
-			self.skip_current_goal()
-			return
-
-		# GUIDE: This replaces the last goal if the robot has gone through the first two.
-		# THIS IS AN EXAMPLE of how to replace goal points. You can also use skip_current_goal and add_more_goal_points
-
-		if len(path_pts) > 0:
-			self.get_logger().info(f"Replacing way points with new ones {path_pts}")
-			self.replace_goal_points(path_pts, False)
-			self.need_new_plan = False
-
-
-# Unlike all the previous code, here we'll start up with a list of points to go to
+        # This sets up a listener for all of the transform types created
+        self.transform_listener = TransformListener(self.tf_buffer, self)
+
+        # Action client for passing "target" messages/state around
+        # An action has a goal, feedback, and a result. This class (the driver) will have the action server side, and be
+        #   responsible for sending feed back and result
+        # The SendPoints class will have the action client - it will send the goals and cancel the goal and send another when 
+        #    the server says it has completed the goal
+        # There is an initial call and response (are you ready for a target?) followed by the target itself
+        #   goal_accept_callback handles accepting the goal
+        #   cancel_callback is called if the goal is actually canceled by the action client
+        #   execute_callback actually starts moving toward the goal
+        self.action_server = ActionServer(node=self,
+                                    action_type=NavTarget,
+                                    action_name="nav_target",
+                                    callback_group=ReentrantCallbackGroup(),
+                                    goal_callback=self.goal_accept_callback,
+                                    cancel_callback=self.cancel_callback,
+                                    execute_callback=self.action_callback)
+
+        # This is the goal in the robot's coordinate system, calculated in set_target
+        self.target = PointStamped()
+        self.target.point.x = 0.0
+        self.target.point.y = 0.0
+
+        # GUIDE: Declare any variables here
+    
+        self.target_dist = None
+        self.target_angle = None
+
+        self.avoiding = False
+        self.avoid_dir = 0  #+1 prefer left, -1 = prefer right, 0 = none
+        self.avoid_turn_bias = 0.7
+        self.avoid_speed = 0.08 #small foward motion while avoiding
+
+        self.angle_gain = 2.5   
+        self.prev_linear_x = 0.0  
+        self.prev_angular_z = 0.0 
+        self.alpha = 0.85         
+
+        # Timer to make sure we publish the target marker (once we get a goal)
+        self.marker_timer = self.create_timer(1.0, self._marker_callback)
+
+        self.count_since_last_scan = 0
+        self.print_twist_messages = False
+        self.print_distance_messages = False
+
+    def zero_twist(self):
+        """This is a helper class method to create and zero-out a twist"""
+        # Don't really need to do this - the default values are zero - but can't hurt
+        t = TwistStamped()
+        t.header.frame_id = 'base_link'
+        t.header.stamp = self.get_clock().now().to_msg()
+        t.twist.linear.x = 0.0
+        t.twist.linear.y = 0.0
+        t.twist.linear.z = 0.0
+        t.twist.angular.x = 0.0
+        t.twist.angular.y = 0.0
+        t.twist.angular.z = 0.0
+
+        return t
+
+    def _marker_callback(self):
+        """Publishes the target so it shows up in RViz"""
+        if not self.goal:
+            # No goal, get rid of marker if there is one
+            if self.target_marker:
+                self.target_marker.action = Marker.DELETE
+                self.target_pub.publish(self.target_marker)
+                self.target_marker = None
+                self.get_logger().info(f"Driver: Had an existing target marker; removing")
+            return
+        
+        # If we do not currently have a marker, make one
+        if not self.target_marker:
+            self.target_marker = Marker()
+            self.target_marker.header.frame_id = self.goal.header.frame_id
+            self.target_marker.id = 0
+        
+            self.get_logger().info(f"Driver: Creating Marker")
+
+        # Build a marker for the target point
+        #   - this prints out the green dot in RViz (the current target)
+        self.target_marker.header.stamp = self.get_clock().now().to_msg()
+        self.target_marker.type = Marker.SPHERE
+        self.target_marker.action = Marker.ADD
+        self.target_marker.pose.position = self.goal.point
+        self.target_marker.scale.x = 0.3
+        self.target_marker.scale.y = 0.3
+        self.target_marker.scale.z = 0.3
+        self.target_marker.color.r = 0.0
+        self.target_marker.color.g = 1.0
+        self.target_marker.color.b = 0.0
+        self.target_marker.color.a = 1.0
+
+        # Publish the marker
+        self.target_pub.publish(self.target_marker)
+
+        # Turn off the timer so we don't just keep making and deleting the target Marker
+        #   Will get turned back on when we get an goal request
+        self.marker_timer.cancel()
+
+    def goal_accept_callback(self, goal_request : ServerGoalHandle):
+        """Accept a request for a new goal"""
+        self.get_logger().info("Received a goal request")
+
+        # Timer to make sure we publish the new target
+        self.marker_timer.reset()
+
+        # Accept all goals. You can use this (in the future) to NOT accept a goal if you want
+        return GoalResponse.ACCEPT
+    
+    def cancel_callback(self, goal_handle : ServerGoalHandle):
+        """Accept or reject a client request to cancel an action."""
+        self.get_logger().info('Received a cancel request')
+
+        # Make sure our goal is removed
+        self.goal = None
+
+        # ...and robot stops
+        t = self.zero_twist()
+        self.cmd_pub.publish(t)
+
+        # reset smoothing memory too
+        self.prev_linear_x = 0.0
+        self.prev_angular_z = 0.0
+                
+        # Timer to make sure we remove the current target (if there is one)
+        self.marker_timer.reset()
+
+        return CancelResponse.ACCEPT
+    
+    def close_enough(self):
+        """ Return true if close enough to goal. This will be used in action_callback to stop moving toward the goal
+        @ return true/false """
+        if self.target_dist is None:
+            return False
+
+        return self.target_dist < self.threshold
+
+    def distance_to_target(self):
+        """ Communicate with send points - set to distance to target"""
+        if self.target_dist is None:
+            return float('inf')
+        return self.target_dist
+    
+    # Respond to the action request.
+    def action_callback(self, goal_handle : ServerGoalHandle):
+        """ This gets called when the new goal is sent by SendPoints
+        @param goal_handle - this has the new goal
+        @return a NavTarget return when done """
+
+        self.get_logger().info(f'Received an execute goal request... {goal_handle.request.goal.point}')
+    
+        # Save the new goal as a stamped point
+        self.goal = PointStamped()
+        self.goal.header = goal_handle.request.goal.header
+        self.goal.point = goal_handle.request.goal.point
+        
+        # Build a result to send back
+        result = NavTarget.Result()
+        result.success = False
+
+        # Reset target
+        self.set_target()
+
+        # Keep publishing feedback, then sleeping (so the laser scan can happen)
+        # GUIDE: If you aren't making progress, stop the while loop and mark the goal as failed
+        best_dist = self.target_dist if self.target_dist is not None else 1e9
+        no_progress_loops = 0
+        rate = self.create_rate(2.0)
+        while not self.close_enough():
+            if not self.goal:
+                self.get_logger().info(f"Goal was canceled")
+                return result
+
+            # Recompute target after motion updates from scan callback
+            self.set_target()
+
+            if self.target_dist is not None:
+                if self.target_dist < best_dist - 0.05:
+                    best_dist = self.target_dist
+                    no_progress_loops = 0
+                else:
+                    no_progress_loops += 1
+            
+            feedback = NavTarget.Feedback()
+            feedback.distance.data = self.distance_to_target()
+            
+            # Publish feedback - this gets sent back to send_points
+            goal_handle.publish_feedback(feedback)
+
+            # If progress stalls for too long, fail the goal so send_points can replan
+            if no_progress_loops > 12:
+                self.get_logger().info("Not making progress, failing current goal")
+                self.goal = None
+                t = self.zero_twist()
+                self.cmd_pub.publish(t)
+                self.prev_linear_x = 0.0
+                self.prev_angular_z = 0.0
+                return result
+
+            # sleep so we can process the next scan
+            rate.sleep()
+            
+        # Timer to make sure we remove the current target
+        self.marker_timer.reset()
+
+        # Don't keep processing goals
+        self.goal = None 
+
+        # Publish the zero twist
+        t = self.zero_twist()
+        self.cmd_pub.publish(t)
+
+        # clear smoothing memory at goal completion
+        self.prev_linear_x = 0.0
+        self.prev_angular_z = 0.0
+
+        self.get_logger().info(f"Completed goal")
+
+        # Set the succeed value on the handle
+        goal_handle.succeed()
+
+        # Set the result to True and return
+        result.success = True
+        return result
+
+    def set_target(self):
+        """ Convert the goal into an x,y position (target) in the ROBOT's coordinate space
+        @return the new target as a Point """
+
+        if self.goal:
+            # Transforms for all coordinate frames in the robot are stored in a transform tree
+            #  odom is the coordinate frame of the "world", base_link is the base link of the robot
+            # A transform stores a rotation/translation to go from one coordinate system to the other
+            transform = self.tf_buffer.lookup_transform('odom', 'base_link', rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=1.0))
+
+            # This applies the transform to the Stamped Point
+            #    Note: This does not work, for reasons that are unclear to me
+            self.target = do_transform_point(self.goal, transform)
+            
+            # This does the transform manually, by calculating the theta rotation from the quaternion
+            euler_ang = -atan2(2 * transform.transform.rotation.z * transform.transform.rotation.w,
+                               1.0 - 2 * transform.transform.rotation.z * transform.transform.rotation.z)
+            
+            # Translate to the base link's origin
+            x = self.goal.point.x - transform.transform.translation.x
+            y = self.goal.point.y - transform.transform.translation.y
+
+            # Do the rotation
+            rot_x = x * cos(euler_ang) - y * sin(euler_ang)
+            rot_y = x * sin(euler_ang) + y * cos(euler_ang)
+
+            #target is in robot frame:(rot_x, rot_y)
+            self.target_dist = sqrt(rot_x*rot_x + rot_y*rot_y)
+            self.target_angle = atan2(rot_y, rot_x)
+
+            self.target.point.x = rot_x
+            self.target.point.y = rot_y
+            if self.print_distance_messages:
+                self.get_logger().info(f'Target relative to robot: ({self.target.point.x:.2f}, {self.target.point.y:.2f}), orig ({self.goal.point.x, self.goal.point.y})')
+            
+        else:
+            if self.print_distance_messages:
+                self.get_logger().info(f'No target to get distance to')
+            self.target = None  
+            self.target_dist = None
+            self.target_angle = None    
+        
+        # GUIDE: Calculate any additional variables here
+        #  Remember that the target's location is in its own coordinate frame at 0,0, angle 0 (x-axis)
+        #
+
+        return self.target
+
+    def scan_callback(self, scan):
+        """ Lidar scan callback
+        @param scan - has information about the scan, and the distances (see stopper.py in lab1)"""
+    
+        if self.print_twist_messages:
+            self.get_logger().info("In scan callback")
+        # Got a scan - set back to zero
+        self.count_since_last_scan = 0
+
+        # If we have a goal, then act on it, otherwise stay still
+        if self.goal:
+            # Recalculate the target point (assumes we've moved)
+            self.set_target()
+
+            # Call the method to actually calculate the twist
+            t = self.get_twist(scan)
+        else:
+            t = self.zero_twist()
+            #t.twist.linear.x = 0.1
+            if self.print_twist_messages:
+                self.get_logger().info(f"No goal, sitting still")
+
+        # Publish the new twist
+        self.cmd_pub.publish(t)
+
+    def get_obstacle(self, scan):
+        """ check if an obstacle
+        @param scan - the lidar scan
+        @return Currently True/False and speed, angular turn"""
+
+        if not self.target:
+            return False, 0.0, 0.0, float('inf'), float('inf'), float('inf')
+        
+        # GUIDE: Use this method to collect obstacle information - is something in front of, to the left, or to 
+        # the right of the robot? Start with your stopper code from Lab1
+        ranges = np.array(scan.ranges, dtype = float)
+        n = len(ranges)
+        thetas = np.linspace(scan.angle_min, scan.angle_max, n, dtype = float)
+
+        #define regions
+        # Narrower front mask helps keep door frames from being treated like a full wall
+        front_mask = np.abs(thetas) < 0.25
+        left_mask = (thetas > 0.25) & (thetas < 1.2)
+        right_mask = (thetas < -0.25) & (thetas > -1.2)
+        
+        def min_dist(mask):
+            vals = ranges[mask]
+            vals = vals[(vals > 0.0) & (~np.isinf(vals))]
+            return float(np.min(vals)) if len(vals) > 0 else float('inf')
+
+        front_dist = min_dist(front_mask)
+        left_dist = min_dist(left_mask)
+        right_dist = min_dist(right_mask)
+
+        #detection
+        obstacle_threshold = 0.6 #meters
+        obstacle_detected = front_dist < obstacle_threshold
+
+        #decide consistent turn direction
+        if abs(left_dist - right_dist) < 0.12:
+            #prefer left
+            obs_turn_dir = +1
+        elif left_dist > right_dist:
+            obs_turn_dir = +1    #turn left
+        else:
+            obs_turn_dir = -1    #turn right
+
+        #set obs speed (small creep forward while avoiding)
+        obs_speed = self.avoid_speed if obstacle_detected else 0.0
+
+        obs_turn = float(self.avoid_turn_bias * obs_turn_dir)
+
+        return obstacle_detected, obs_speed, obs_turn, front_dist, left_dist, right_dist
+
+    def get_twist(self, scan):
+        """This is the method that calculate the twist
+        @param scan - a LaserScan message with the current data from the LiDAR.  Use this for obstacle avoidance. 
+            This is the same as your lab1 go and stop code
+        @return a twist command"""
+        
+        # Strategy: We implement a State Machine for obstacle avoidance to prevent "corner trapping".
+        # When an obstacle breaches the safety margin, the robot enters the 'avoiding' state, 
+        # picks the most open direction (left or right), and commits to that turn until the front 
+        # is completely clear. Finally, we apply a low-pass filter (alpha = 0.85) to all output 
+        # twist commands to guarantee smooth physical movement and prevent mechanical jitter.
+        
+        t = self.zero_twist()
+
+        # GUIDE:
+        #  Step 1) Calculate the angle the robot has to turn to in order to point at the target
+        #  Step 2) Set your speed based on how far away you are from the target, as before
+        #  Step 3) Add code that veers left (or right) to avoid an obstacle in front of it
+        # Reminder: t.linear.x = 0.1    sets the forward speed to 0.1
+        #           t.angular.z = pi/2   sets the angular speed to 90 degrees per sec
+        # Reminder 2: target is in self.target 
+        #  Note: If the target is behind you, might turn first before moving
+        #  Note: 0.4 is a good speed if nothing is in front of the robot
+        if self.target is None or self.target_dist is None:
+            return t
+
+        angle = self.target_angle
+        dist = self.target_dist
+
+        # 【你的参数】：完全保留！
+        min_speed = 0.06
+        max_speed = 0.5
+        max_turn = np.pi * 0.4
+
+        # speed toward target
+        speed = 0.9 * dist
+        speed = max(min_speed, min(max_speed, speed))
+
+        # check obstacles
+        obstacle_detected, obs_speed, obs_turn_raw, front_dist, left_dist, right_dist = self.get_obstacle(scan)
+
+        # obs_turn isn't larger than max_turn
+        obs_turn = float(max(-max_turn, min(max_turn, obs_turn_raw)))
+
+        cmd_v = 0.0
+        cmd_w = 0.0
+
+        # if we're getting close enough, stop
+        if self.close_enough():
+            self.avoiding = False
+            self.avoid_dir = 0
+            cmd_v = 0.0
+            cmd_w = 0.0
+        else:
+            # Keep a healthier clearance from walls so the robot doesn't scrape
+            # along them or oscillate when partially inside a wall cell.
+            side_clearance = 0.22
+            hard_side_clearance = 0.16
+            safe_stop = 0.55
+            front_escape = 0.32
+
+            too_close_left = left_dist < side_clearance
+            too_close_right = right_dist < side_clearance
+            trapped_left = left_dist < hard_side_clearance
+            trapped_right = right_dist < hard_side_clearance
+
+            blocking = obstacle_detected and (front_dist < self.target_dist + 0.08)
+
+            # if blocking iand not avoiding, start avoiding
+            if (blocking or too_close_left or too_close_right) and not self.avoiding:
+                self.avoiding = True
+                # choose direction
+                if trapped_left and not trapped_right:
+                    self.avoid_dir = -1
+                elif trapped_right and not trapped_left:
+                    self.avoid_dir = 1
+                elif too_close_left and not too_close_right:
+                    self.avoid_dir = -1
+                elif too_close_right and not too_close_left:
+                    self.avoid_dir = 1
+                elif abs(left_dist - right_dist) < 0.12:
+                    self.avoid_dir = 1 if (left_dist >= right_dist) else -1
+                else:
+                    self.avoid_dir = 1 if (left_dist > right_dist) else -1
+
+            # if not blocking and not in avoiding state, normal behavior
+            if self.avoiding:
+                release_clear_dist = 0.7
+
+                if front_dist > release_clear_dist and min(left_dist, right_dist) > 0.28:
+                    self.avoiding = False
+                    self.avoid_dir = 0
+                else:
+                    if front_dist < front_escape or trapped_left or trapped_right:
+                        cmd_v = 0.0
+                    else:
+                        cmd_v = float(self.avoid_speed)
+                    cmd_w = float(max(-max_turn, min(max_turn, 1.1 * self.avoid_turn_bias * self.avoid_dir)))
+
+            if not self.avoiding:
+                if front_dist < safe_stop:
+                    # force avoidance state
+                    self.avoiding = True
+                    # set avoid_dir if unknown
+                    if too_close_left and not too_close_right:
+                        self.avoid_dir = -1
+                    elif too_close_right and not too_close_left:
+                        self.avoid_dir = 1
+                    elif self.avoid_dir == 0:
+                        self.avoid_dir = 1 if (left_dist > right_dist) else -1
+                    cmd_v = 0.0
+                    cmd_w = float(max(-max_turn, min(max_turn, self.avoid_turn_bias * self.avoid_dir)))
+                else:
+                    # normal navigation
+                    # angle_gain = 2.5
+                    turn = self.angle_gain * angle 
+                    cmd_w = float(max(-max_turn, min(max_turn, turn)))
+
+                    # allow forward motion if target is in front
+                    angle_threshold_for_foward = 0.8 
+                    if abs(angle) < angle_threshold_for_foward:
+                        cmd_v = float(speed)
+                    else:
+                        cmd_v = 0.0
+
+                    # If we're skimming a wall, slow down and bias away from it.
+                    if too_close_left or too_close_right:
+                        cmd_v = min(cmd_v, 0.12)
+                        if too_close_left and not too_close_right:
+                            cmd_w = min(cmd_w, -0.45)
+                        elif too_close_right and not too_close_left:
+                            cmd_w = max(cmd_w, 0.45)
+
+        final_linear_x = self.alpha * cmd_v + (1 - self.alpha) * self.prev_linear_x
+        final_angular_z = self.alpha * cmd_w + (1 - self.alpha) * self.prev_angular_z
+
+        # Save current smoothed commands for the next frame
+        self.prev_linear_x = final_linear_x
+        self.prev_angular_z = final_angular_z
+
+        # Assign to the actual twist message
+        t.twist.linear.x = float(final_linear_x)
+        t.twist.angular.z = float(final_angular_z)
+
+        if self.print_twist_messages:
+            self.get_logger().info(f"Setting twist forward {t.twist.linear.x} angle {t.twist.angular.z}")
+        
+        return t
+    
+# The idiom in ROS2 is to use a function to do all of the setup and work.  This
+# function is referenced in the setup.py file as the entry point of the node when
+# we're running the node with ros2 run.  The function should have one argument, for
+# passing command line arguments, and it should default to None.
 def main(args=None):
-	# Initialize rclpy.  We should do this every time.
-	rclpy.init(args=args)
+    # Initialize rclpy.  We should do this every time.
+    rclpy.init(args=args)
 
-	# Create a list of points that will take the robot through the map
-	points = [(-4.5, -3.0), (-4.5, 0.0), (-1.0, 0.0)]
-	send_points = SendPoints(points)
+    # Make a node class.  The idiom in ROS2 is to encapsulte everything in a class
+    # that derives from Node.
+    driver = Lab3Driver()
 
-	# Multi-threaded execution
-	executor = MultiThreadedExecutor()
-	executor.add_node(send_points)
-	executor.spin()
-	#rclpy.spin(send_points)
-
-	# Make sure we shutdown everything cleanly.  This should happen, even if we don't
-	# include this line, but you should do it anyway.
-	rclpy.shutdown()
-	
+    # Multi-threaded execution
+    executor = MultiThreadedExecutor()
+    executor.add_node(driver)
+    executor.spin()
+    
+    # Make sure we shutdown everything cleanly.  This should happen, even if we don't
+    # include this line, but you should do it anyway.
+    rclpy.shutdown()
+    
 
 # If we run the node as a script, then we're going to start here.
 if __name__ == '__main__':
-	# The idiom in ROS2 is to set up a main() function and to call it from the entry
-	# point of the script.
-	main()
+    # The idiom in ROS2 is to set up a main() function and to call it from the entry
+    # point of the script.
+    main()
