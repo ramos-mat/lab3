@@ -167,31 +167,25 @@ def find_best_point(im, possible_points : list, robot_loc):
                             if abs(jx) <= 1 and abs(jy) <= 1:
                                 wall_neighbors += 1
 
-                # Stay on reachable free space near unknown space, but don't require
-                # an unrealistically perfect 3x3 patch of only free/unseen cells.
                 if unseen_neighbors == 0 or free_neighbors < 2:
                     continue
 
                 dist_to_robot = np.hypot(cand[0] - robot_loc[0], cand[1] - robot_loc[1])
-                candidate_scores.append((cand, dist_to_robot, unseen_neighbors, free_neighbors, wall_neighbors))
+                candidate_scores.append((cand, dist_to_robot, unseen_neighbors, free_neighbors, wall_neighbors, extended_unseen))
 
     if not candidate_scores:
         return None
 
-    # Avoid choosing a frontier that is basically on top of the robot unless there
-    # truly is no better option. This helps the robot commit to leaving the room.
     min_progress_distance = 7.0
     far_candidates = [entry for entry in candidate_scores if entry[1] >= min_progress_distance]
     if far_candidates:
         candidate_scores = far_candidates
 
-    for cand, dist_to_robot, unseen_neighbors, free_neighbors, wall_neighbors in candidate_scores:
-        # Reward frontiers that expose more unknown space, while still mildly
-        # preferring farther candidates and penalizing tight wall-hugging cells.
+    for cand, dist_to_robot, unseen_neighbors, free_neighbors, wall_neighbors, extended_unseen in candidate_scores:
         score = (
-            3.0 * unseen_neighbors
-            + 1.4 * extended_unseen
-            + 0.6 * min(dist_to_robot, 30.0)
+            3.5 * unseen_neighbors
+            + 0.8 * extended_unseen
+            + 0.35 * min(dist_to_robot, 25.0)
             - 2.0 * wall_neighbors
             + 0.4 * free_neighbors
         )
@@ -214,15 +208,30 @@ def find_waypoints(im, path):
 
     if path is None:
         return None
+    if len(path) <= 2:
+        return list(path)
 
-    waypoints = []
+    waypoints = [path[0]]
+    last_kept_index = 0
+    spacing = max(10, len(path) // 6)
 
-    step = max(1, len(path)//10)
+    for i in range(1, len(path) - 1):
+        prev_pt = path[i - 1]
+        curr_pt = path[i]
+        next_pt = path[i + 1]
 
-    for i in range(0, len(path), step):
-        waypoints.append(path[i])
+        prev_dir = (curr_pt[0] - prev_pt[0], curr_pt[1] - prev_pt[1])
+        next_dir = (next_pt[0] - curr_pt[0], next_pt[1] - curr_pt[1])
 
-    if path[-1] not in waypoints:
+        is_corner = prev_dir != next_dir
+        far_enough = (i - last_kept_index) >= spacing
+
+        if is_corner or far_enough:
+            if curr_pt != waypoints[-1]:
+                waypoints.append(curr_pt)
+                last_kept_index = i
+
+    if path[-1] != waypoints[-1]:
         waypoints.append(path[-1])
 
     return waypoints
