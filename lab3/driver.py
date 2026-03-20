@@ -107,8 +107,9 @@ class Lab3Driver(Node):
 
         self.avoiding = False
         self.avoid_dir = 0  #+1 prefer left, -1 = prefer right, 0 = none
-        self.avoid_turn_bias = 0.55
-        self.avoid_speed = 0.10 #small forward motion while avoiding
+        self.avoid_clear_count = 0
+        self.avoid_turn_bias = 0.48
+        self.avoid_speed = 0.15
 
         self.angle_gain = 2.5   
         self.prev_linear_x = 0.0  
@@ -139,7 +140,9 @@ class Lab3Driver(Node):
 
     def _marker_callback(self):
         """Publishes the target so it shows up in RViz"""
-        if not self.goal:
+        goal = self.goal
+
+        if not goal:
             # No goal, get rid of marker if there is one
             if self.target_marker:
                 self.target_marker.action = Marker.DELETE
@@ -151,7 +154,7 @@ class Lab3Driver(Node):
         # If we do not currently have a marker, make one
         if not self.target_marker:
             self.target_marker = Marker()
-            self.target_marker.header.frame_id = self.goal.header.frame_id
+            self.target_marker.header.frame_id = goal.header.frame_id
             self.target_marker.id = 0
         
             self.get_logger().info(f"Driver: Creating Marker")
@@ -159,9 +162,10 @@ class Lab3Driver(Node):
         # Build a marker for the target point
         #   - this prints out the green dot in RViz (the current target)
         self.target_marker.header.stamp = self.get_clock().now().to_msg()
+        self.target_marker.header.frame_id = goal.header.frame_id
         self.target_marker.type = Marker.SPHERE
         self.target_marker.action = Marker.ADD
-        self.target_marker.pose.position = self.goal.point
+        self.target_marker.pose.position = goal.point
         self.target_marker.scale.x = 0.3
         self.target_marker.scale.y = 0.3
         self.target_marker.scale.z = 0.3
@@ -384,7 +388,7 @@ class Lab3Driver(Node):
         @return Currently True/False and speed, angular turn"""
 
         if not self.target:
-            return False, 0.0, 0.0, float('inf'), float('inf'), float('inf')
+            return False, 0.0, 0.0, float('inf'), float('inf'), float('inf'), float('inf'), float('inf'), float('inf'), float('inf'), float('inf')
         
         # GUIDE: Use this method to collect obstacle information - is something in front of, to the left, or to 
         # the right of the robot? Start with your stopper code from Lab1
@@ -393,12 +397,14 @@ class Lab3Driver(Node):
         thetas = np.linspace(scan.angle_min, scan.angle_max, n, dtype = float)
 
         #define regions
-        # Narrower front mask helps keep door frames from being treated like a full wall
-        front_mask = np.abs(thetas) < 0.32
-        left_mask = (thetas > 0.2) & (thetas < 1.35)
-        right_mask = (thetas < -0.2) & (thetas > -1.35)
-        front_left_mask = (thetas >= 0.0) & (thetas < 0.55)
-        front_right_mask = (thetas <= 0.0) & (thetas > -0.55)
+        front_mask = np.abs(thetas) < 0.38
+        left_mask = (thetas > 0.15) & (thetas < 1.45)
+        right_mask = (thetas < -0.15) & (thetas > -1.45)
+        front_left_mask = (thetas >= -0.05) & (thetas < 0.72)
+        front_right_mask = (thetas <= 0.05) & (thetas > -0.72)
+        back_mask = np.abs(np.abs(thetas) - np.pi) < 0.45
+        back_left_mask = (thetas > 2.20) & (thetas < 3.05)
+        back_right_mask = (thetas < -2.20) & (thetas > -3.05)
         
         def min_dist(mask):
             vals = ranges[mask]
@@ -410,6 +416,9 @@ class Lab3Driver(Node):
         right_dist = min_dist(right_mask)
         front_left_dist = min_dist(front_left_mask)
         front_right_dist = min_dist(front_right_mask)
+        back_dist = min_dist(back_mask)
+        back_left_dist = min_dist(back_left_mask)
+        back_right_dist = min_dist(back_right_mask)
 
         #detection
         obstacle_threshold = 0.75 #meters
@@ -429,19 +438,13 @@ class Lab3Driver(Node):
 
         obs_turn = float(self.avoid_turn_bias * obs_turn_dir)
 
-        return obstacle_detected, obs_speed, obs_turn, front_dist, left_dist, right_dist, front_left_dist, front_right_dist
+        return obstacle_detected, obs_speed, obs_turn, front_dist, left_dist, right_dist, front_left_dist, front_right_dist, back_dist, back_left_dist, back_right_dist
 
     def get_twist(self, scan):
         """This is the method that calculate the twist
         @param scan - a LaserScan message with the current data from the LiDAR.  Use this for obstacle avoidance. 
             This is the same as your lab1 go and stop code
         @return a twist command"""
-        
-        # Strategy: We implement a State Machine for obstacle avoidance to prevent "corner trapping".
-        # When an obstacle breaches the safety margin, the robot enters the 'avoiding' state, 
-        # picks the most open direction (left or right), and commits to that turn until the front 
-        # is completely clear. Finally, we apply a low-pass filter (alpha = 0.85) to all output 
-        # twist commands to guarantee smooth physical movement and prevent mechanical jitter.
         
         t = self.zero_twist()
 
@@ -460,9 +463,8 @@ class Lab3Driver(Node):
         angle = self.target_angle
         dist = self.target_dist
 
-        # 【你的参数】：完全保留！
         min_speed = 0.06
-        max_speed = 0.42
+        max_speed = 0.60
         max_turn = np.pi * 0.4
 
         # speed toward target
@@ -470,41 +472,46 @@ class Lab3Driver(Node):
         speed = max(min_speed, min(max_speed, speed))
 
         # check obstacles
-        obstacle_detected, obs_speed, obs_turn_raw, front_dist, left_dist, right_dist, front_left_dist, front_right_dist = self.get_obstacle(scan)
+        obstacle_detected, obs_speed, obs_turn_raw, front_dist, left_dist, right_dist, front_left_dist, front_right_dist, back_dist, back_left_dist, back_right_dist = self.get_obstacle(scan)
 
         # obs_turn isn't larger than max_turn
         obs_turn = float(max(-max_turn, min(max_turn, obs_turn_raw)))
 
         cmd_v = 0.0
         cmd_w = 0.0
+        nearest_forward = min(front_dist, front_left_dist, front_right_dist)
 
         # if we're getting close enough, stop
         if self.close_enough():
             self.avoiding = False
             self.avoid_dir = 0
+            self.avoid_clear_count = 0
             cmd_v = 0.0
             cmd_w = 0.0
         else:
-            # Keep a healthier clearance from walls so the robot doesn't scrape
-            # along them or oscillate when partially inside a wall cell.
-            side_clearance = 0.20
-            hard_side_clearance = 0.14
-            safe_stop = 0.52
+            side_clearance = 0.24
+            hard_side_clearance = 0.18
+            safe_stop = 0.46
             front_escape = 0.28
 
             too_close_left = left_dist < side_clearance
             too_close_right = right_dist < side_clearance
             trapped_left = left_dist < hard_side_clearance
             trapped_right = right_dist < hard_side_clearance
-            front_left_blocked = front_left_dist < 0.42
-            front_right_blocked = front_right_dist < 0.42
-            corner_trapped = front_dist < 0.34 and (too_close_left or too_close_right)
+            front_left_blocked = front_left_dist < 0.56
+            front_right_blocked = front_right_dist < 0.56
+            corner_trapped = front_dist < 0.40 and (too_close_left or too_close_right)
 
             blocking = obstacle_detected and (front_dist < self.target_dist + 0.08)
+            # Slow down smoothly as we get closer to things in front of the robot.
+            if nearest_forward < 0.85:
+                scale = max(0.0, min(1.0, (nearest_forward - 0.20) / 0.65))
+                speed = max(0.0, speed * scale)
 
             # if blocking iand not avoiding, start avoiding
             if (blocking or too_close_left or too_close_right) and not self.avoiding:
                 self.avoiding = True
+                self.avoid_clear_count = 0
                 # choose direction
                 if trapped_left and not trapped_right:
                     self.avoid_dir = -1
@@ -528,22 +535,26 @@ class Lab3Driver(Node):
                 release_clear_dist = 0.62
 
                 if front_dist > release_clear_dist and min(left_dist, right_dist) > 0.28:
-                    self.avoiding = False
-                    self.avoid_dir = 0
+                    self.avoid_clear_count += 1
+                    if self.avoid_clear_count >= 4:
+                        self.avoiding = False
+                        self.avoid_dir = 0
+                        self.avoid_clear_count = 0
                 else:
+                    self.avoid_clear_count = 0
                     if front_dist < front_escape or corner_trapped:
                         cmd_v = 0.0
                     elif trapped_left or trapped_right:
-                        # Small crawl reduces the chance of pivoting the rear into a wall.
-                        cmd_v = 0.04
+                        cmd_v = 0.07
                     else:
-                        cmd_v = float(self.avoid_speed)
+                        cmd_v = float(min(self.avoid_speed, 0.22))
                     cmd_w = float(max(-max_turn, min(max_turn, 1.05 * self.avoid_turn_bias * self.avoid_dir)))
 
             if not self.avoiding:
                 if front_dist < safe_stop:
                     # force avoidance state
                     self.avoiding = True
+                    self.avoid_clear_count = 0
                     # set avoid_dir if unknown
                     if too_close_left and not too_close_right:
                         self.avoid_dir = -1
@@ -570,28 +581,65 @@ class Lab3Driver(Node):
                     else:
                         cmd_v = 0.0
 
-                    # If we're skimming a wall, slow down and bias away from it.
-                    if too_close_left or too_close_right:
-                        cmd_v = min(cmd_v, 0.10)
-                        if too_close_left and not too_close_right:
-                            cmd_w = min(cmd_w, -0.45)
-                        elif too_close_right and not too_close_left:
+                    need_wide_turn = (
+                        abs(angle) > 1.2 and
+                        (too_close_left or too_close_right or front_left_blocked or front_right_blocked)
+                    )
+                    if need_wide_turn and front_dist > 0.45:
+                        cmd_v = max(cmd_v, 0.05)
+                        if left_dist > right_dist + 0.05:
                             cmd_w = max(cmd_w, 0.45)
+                        elif right_dist > left_dist + 0.05:
+                            cmd_w = min(cmd_w, -0.45)
 
-                    # If an obstacle is diagonally ahead on one side, bias away early.
+                    if too_close_left or too_close_right:
+                        cmd_v = min(cmd_v, 0.16)
+                        if too_close_left and not too_close_right:
+                            cmd_w = min(cmd_w, -0.55)
+                        elif too_close_right and not too_close_left:
+                            cmd_w = max(cmd_w, 0.55)
+
                     if front_left_blocked and not front_right_blocked:
-                        cmd_v = min(cmd_v, 0.08)
-                        cmd_w = min(cmd_w, -0.45)
+                        cmd_v = min(cmd_v, 0.11)
+                        cmd_w = min(cmd_w, -0.55)
                     elif front_right_blocked and not front_left_blocked:
-                        cmd_v = min(cmd_v, 0.08)
-                        cmd_w = max(cmd_w, 0.45)
+                        cmd_v = min(cmd_v, 0.11)
+                        cmd_w = max(cmd_w, 0.55)
 
                     if corner_trapped:
                         cmd_v = 0.0
                         if too_close_left and not too_close_right:
-                            cmd_w = max(cmd_w, 0.55)
+                            cmd_w = max(cmd_w, 0.65)
                         elif too_close_right and not too_close_left:
-                            cmd_w = min(cmd_w, -0.55)
+                            cmd_w = min(cmd_w, -0.65)
+
+        # Last safety clamp before smoothing/publish.
+        if nearest_forward < 0.32:
+            cmd_v = 0.0
+        elif nearest_forward < 0.42:
+            cmd_v = min(cmd_v, 0.06)
+        elif nearest_forward < 0.58:
+            cmd_v = min(cmd_v, 0.15)
+
+        if min(left_dist, right_dist) < 0.20:
+            cmd_v = min(cmd_v, 0.08)
+
+        turn_ratio = abs(cmd_w) / max_turn if max_turn > 0 else 0.0
+        if turn_ratio > 0.75:
+            cmd_v = min(cmd_v, 0.05)
+            if nearest_forward < 0.55 or min(left_dist, right_dist) < 0.26:
+                cmd_v = min(cmd_v, 0.03)
+        elif turn_ratio > 0.45:
+            cmd_v = min(cmd_v, 0.16)
+
+        rear_tight = min(back_dist, back_left_dist, back_right_dist) < 0.28
+        if abs(cmd_w) > 0.45 and rear_tight:
+            if front_dist > 0.45 and nearest_forward > 0.40:
+                cmd_v = max(cmd_v, 0.05)
+                cmd_w = max(-0.45, min(0.45, cmd_w))
+            else:
+                cmd_v = 0.0
+                cmd_w = max(-0.28, min(0.28, cmd_w))
 
         final_linear_x = self.alpha * cmd_v + (1 - self.alpha) * self.prev_linear_x
         final_angular_z = self.alpha * cmd_w + (1 - self.alpha) * self.prev_angular_z
