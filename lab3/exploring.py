@@ -151,16 +151,21 @@ def find_best_point(im, possible_points : list, robot_loc):
                 free_neighbors = 0
                 unseen_neighbors = 0
                 wall_neighbors = 0
+                extended_unseen = 0
 
-                for jx in range(-1, 2):
-                    for jy in range(-1, 2):
+                for jx in range(-2, 3):
+                    for jy in range(-2, 3):
                         nbr = (cand[0] + jx, cand[1] + jy)
                         if path_planning.is_free(im, nbr):
-                            free_neighbors += 1
+                            if abs(jx) <= 1 and abs(jy) <= 1:
+                                free_neighbors += 1
                         elif path_planning.is_unseen(im, nbr):
-                            unseen_neighbors += 1
+                            extended_unseen += 1
+                            if abs(jx) <= 1 and abs(jy) <= 1:
+                                unseen_neighbors += 1
                         else:
-                            wall_neighbors += 1
+                            if abs(jx) <= 1 and abs(jy) <= 1:
+                                wall_neighbors += 1
 
                 # Stay on reachable free space near unknown space, but don't require
                 # an unrealistically perfect 3x3 patch of only free/unseen cells.
@@ -183,7 +188,13 @@ def find_best_point(im, possible_points : list, robot_loc):
     for cand, dist_to_robot, unseen_neighbors, free_neighbors, wall_neighbors in candidate_scores:
         # Reward frontiers that expose more unknown space, while still mildly
         # preferring farther candidates and penalizing tight wall-hugging cells.
-        score = 4.0 * unseen_neighbors + 0.35 * min(dist_to_robot, 20.0) - 2.5 * wall_neighbors + 0.5 * free_neighbors
+        score = (
+            3.0 * unseen_neighbors
+            + 1.4 * extended_unseen
+            + 0.6 * min(dist_to_robot, 30.0)
+            - 2.0 * wall_neighbors
+            + 0.4 * free_neighbors
+        )
 
         if score > best_score:
             best_score = score
