@@ -18,7 +18,7 @@
 import numpy as np
 import os
 
-# Your path planning code 
+# Your path planning code
 try:
     import lab3.path_planning as path_planning
 except:
@@ -98,10 +98,11 @@ def is_reachable(im, pix):
     #  False otherwise
     # You can use four or eight connected - eight will return more points
     # YOUR CODE HERE
-    for pt in path_planning.eight_connected(pix):
-        if 0 <= pt[0] < im.shape[1] and 0 <= pt[1] < im.shape[0]:
-            if path_planning.is_free(im, pt):
+    for ix in range(-1, 2):
+        for iy in range(-1, 2):
+            if path_planning.is_free(im, (pix[0] + ix, pix[1] + iy)):
                 return True
+
     return False
 
 
@@ -113,27 +114,17 @@ def find_all_possible_goals(im):
     @return list of possible pixel (x,y) locations"""
 
     # YOUR CODE HERE
-    free = (im == 255)
-    unseen = (im == 128)
+    possible = []
 
-    unseen_neighbor = np.zeros_like(unseen, dtype=bool)
+    h, w = im.shape
 
-    unseen_neighbor[1:, :] = np.logical_or(unseen_neighbor[1:, :], unseen[:-1, :])
-    unseen_neighbor[:-1, :] = np.logical_or(unseen_neighbor[:-1, :], unseen[1:, :])
-    unseen_neighbor[:, 1:] = np.logical_or(unseen_neighbor[:, 1:], unseen[:, :-1])
-    unseen_neighbor[:, :-1] = np.logical_or(unseen_neighbor[:, :-1], unseen[:, 1:])
+    for i in range(1, w-1):
+        for j in range(1, h-1):
 
-    unseen_neighbor[1:, 1:] = np.logical_or(unseen_neighbor[1:, 1:], unseen[:-1, :-1])
-    unseen_neighbor[1:, :-1] = np.logical_or(unseen_neighbor[1:, :-1], unseen[:-1, 1:])
-    unseen_neighbor[:-1, 1:] = np.logical_or(unseen_neighbor[:-1, 1:], unseen[1:, :-1])
-    unseen_neighbor[:-1, :-1] = np.logical_or(unseen_neighbor[:-1, :-1], unseen[1:, 1:])
+            if path_planning.is_unseen(im, (i, j)) and is_reachable(im, (i, j)):
+                possible.append((i, j))
 
-    possible_mask = np.logical_and(free, unseen_neighbor)
-
-    ys, xs = np.where(possible_mask)
-    possible_points = [(int(x), int(y)) for x, y in zip(xs, ys)]
-
-    return possible_points
+    return possible
 
 def find_best_point(im, possible_points : list, robot_loc):
     """ Pick one of the unseen points to go to
@@ -142,57 +133,64 @@ def find_best_point(im, possible_points : list, robot_loc):
     @param robot_loc - location of the robot (in case you want to factor that in)
     """
     # YOUR CODE HERE
-    best_point = None
-    best_distance = None
+    if not possible_points:
+        return None
+
+    best_pt = None
+    best_score = float('-inf')
+    candidate_scores = []
 
     for pt in possible_points:
-        count_free = 0
-        count_unseen = 0
-        good_point = True
-
         for ix in range(-1, 2):
             for iy in range(-1, 2):
-                check_pt = (pt[0] + ix, pt[1] + iy)
+                cand = (pt[0] + ix, pt[1] + iy)
 
-                if not (0 <= check_pt[0] < im.shape[1] and 0 <= check_pt[1] < im.shape[0]):
-                    good_point = False
+                if not path_planning.is_free(im, cand):
                     continue
 
-                if path_planning.is_free(im, check_pt):
-                    count_free += 1
-                elif path_planning.is_unseen(im, check_pt):
-                    count_unseen += 1
-                else:
-                    good_point = False
+                free_neighbors = 0
+                unseen_neighbors = 0
+                wall_neighbors = 0
 
-        if count_free < 3:
-            good_point = False
+                for jx in range(-1, 2):
+                    for jy in range(-1, 2):
+                        nbr = (cand[0] + jx, cand[1] + jy)
+                        if path_planning.is_free(im, nbr):
+                            free_neighbors += 1
+                        elif path_planning.is_unseen(im, nbr):
+                            unseen_neighbors += 1
+                        else:
+                            wall_neighbors += 1
 
-        if count_free + count_unseen != 9:
-            good_point = False
+                # Stay on reachable free space near unknown space, but don't require
+                # an unrealistically perfect 3x3 patch of only free/unseen cells.
+                if unseen_neighbors == 0 or free_neighbors < 2:
+                    continue
 
-        if good_point:
-            dist = np.sqrt((pt[0] - robot_loc[0])**2 + (pt[1] - robot_loc[1])**2)
-            if best_point is None or dist < best_distance:
-                best_point = pt
-                best_distance = dist
+                dist_to_robot = np.hypot(cand[0] - robot_loc[0], cand[1] - robot_loc[1])
+                candidate_scores.append((cand, dist_to_robot, unseen_neighbors, free_neighbors, wall_neighbors))
 
-    if best_point is not None:
-        return best_point
+    if not candidate_scores:
+        return None
 
-    if len(possible_points) > 0:
-        best_point = possible_points[0]
-        best_distance = np.sqrt((best_point[0] - robot_loc[0])**2 + (best_point[1] - robot_loc[1])**2)
+    # Avoid choosing a frontier that is basically on top of the robot unless there
+    # truly is no better option. This helps the robot commit to leaving the room.
+    min_progress_distance = 7.0
+    far_candidates = [entry for entry in candidate_scores if entry[1] >= min_progress_distance]
+    if far_candidates:
+        candidate_scores = far_candidates
 
-        for pt in possible_points:
-            dist = np.sqrt((pt[0] - robot_loc[0])**2 + (pt[1] - robot_loc[1])**2)
-            if dist < best_distance:
-                best_point = pt
-                best_distance = dist
+    for cand, dist_to_robot, unseen_neighbors, free_neighbors, wall_neighbors in candidate_scores:
+        # Reward frontiers that expose more unknown space, while still mildly
+        # preferring farther candidates and penalizing tight wall-hugging cells.
+        score = 4.0 * unseen_neighbors + 0.35 * min(dist_to_robot, 20.0) - 2.5 * wall_neighbors + 0.5 * free_neighbors
 
-        return best_point
+        if score > best_score:
+            best_score = score
+            best_pt = cand
 
-    return robot_loc
+    return best_pt
+    
 
 def find_waypoints(im, path):
     """ Place waypoints along the path
@@ -202,31 +200,21 @@ def find_waypoints(im, path):
 
     # Again, no right answer here
     # YOUR CODE HERE
-    if len(path) <= 2:
-        return path
 
-    waypoints = [path[0]]
+    if path is None:
+        return None
 
-    for i in range(1, len(path) - 1):
-        prev_pt = path[i - 1]
-        curr_pt = path[i]
-        next_pt = path[i + 1]
+    waypoints = []
 
-        dir1 = (curr_pt[0] - prev_pt[0], curr_pt[1] - prev_pt[1])
-        dir2 = (next_pt[0] - curr_pt[0], next_pt[1] - curr_pt[1])
+    step = max(1, len(path)//10)
 
-        if dir1 != dir2:
-            waypoints.append(curr_pt)
+    for i in range(0, len(path), step):
+        waypoints.append(path[i])
 
-    if waypoints[-1] != path[-1]:
+    if path[-1] not in waypoints:
         waypoints.append(path[-1])
 
-    if len(waypoints) > 10:
-        indices = np.linspace(0, len(path) - 1, 10, dtype=int)
-        waypoints = [path[i] for i in indices]
-
     return waypoints
-
 
 def test_unseen(im, pts):
     for pt in pts:
