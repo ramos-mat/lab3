@@ -48,7 +48,7 @@ from rclpy.executors import MultiThreadedExecutor
 
 
 class Lab3Driver(Node):
-    def __init__(self, threshold=0.2):
+    def __init__(self, threshold=0.1):
         """ We have parameters this time
         @param threshold - how close do you have to be before saying you're at the goal? Set to width of robot
         """
@@ -101,13 +101,14 @@ class Lab3Driver(Node):
         self.target.point.y = 0.0
 
         # GUIDE: Declare any variables here
+    
         self.target_dist = None
         self.target_angle = None
 
         self.avoiding = False
         self.avoid_dir = 0  #+1 prefer left, -1 = prefer right, 0 = none
         self.avoid_turn_bias = 0.7
-        self.avoid_speed = 0.04 #small foward motion while avoiding
+        self.avoid_speed = 0.08 #small foward motion while avoiding
 
         self.angle_gain = 2.5   
         self.prev_linear_x = 0.0  
@@ -196,6 +197,10 @@ class Lab3Driver(Node):
         # ...and robot stops
         t = self.zero_twist()
         self.cmd_pub.publish(t)
+
+        # reset smoothing memory too
+        self.prev_linear_x = 0.0
+        self.prev_angular_z = 0.0
                 
         # Timer to make sure we remove the current target (if there is one)
         self.marker_timer.reset()
@@ -208,11 +213,13 @@ class Lab3Driver(Node):
         if self.target_dist is None:
             return False
 
-        return self.target_dist < 0.55   #meters
+        return self.target_dist < self.threshold
 
     def distance_to_target(self):
         """ Communicate with send points - set to distance to target"""
-        return np.sqrt(self.target.point.x ** 2 + self.target.point.y ** 2)
+        if self.target_dist is None:
+            return float('inf')
+        return self.target_dist
     
     # Respond to the action request.
     def action_callback(self, goal_handle : ServerGoalHandle):
@@ -236,18 +243,39 @@ class Lab3Driver(Node):
 
         # Keep publishing feedback, then sleeping (so the laser scan can happen)
         # GUIDE: If you aren't making progress, stop the while loop and mark the goal as failed
-        rate = self.create_rate(0.5)
+        best_dist = self.target_dist if self.target_dist is not None else 1e9
+        no_progress_loops = 0
+        rate = self.create_rate(2.0)
         while not self.close_enough():
             if not self.goal:
                 self.get_logger().info(f"Goal was canceled")
-
                 return result
+
+            # Recompute target after motion updates from scan callback
+            self.set_target()
+
+            if self.target_dist is not None:
+                if self.target_dist < best_dist - 0.05:
+                    best_dist = self.target_dist
+                    no_progress_loops = 0
+                else:
+                    no_progress_loops += 1
             
             feedback = NavTarget.Feedback()
             feedback.distance.data = self.distance_to_target()
             
             # Publish feedback - this gets sent back to send_points
             goal_handle.publish_feedback(feedback)
+
+            # If progress stalls for too long, fail the goal so send_points can replan
+            if no_progress_loops > 12:
+                self.get_logger().info("Not making progress, failing current goal")
+                self.goal = None
+                t = self.zero_twist()
+                self.cmd_pub.publish(t)
+                self.prev_linear_x = 0.0
+                self.prev_angular_z = 0.0
+                return result
 
             # sleep so we can process the next scan
             rate.sleep()
@@ -261,6 +289,10 @@ class Lab3Driver(Node):
         # Publish the zero twist
         t = self.zero_twist()
         self.cmd_pub.publish(t)
+
+        # clear smoothing memory at goal completion
+        self.prev_linear_x = 0.0
+        self.prev_angular_z = 0.0
 
         self.get_logger().info(f"Completed goal")
 
@@ -359,7 +391,8 @@ class Lab3Driver(Node):
         thetas = np.linspace(scan.angle_min, scan.angle_max, n, dtype = float)
 
         #define regions
-        front_mask = np.abs(thetas) < 0.55
+        # Narrower front mask helps keep door frames from being treated like a full wall
+        front_mask = np.abs(thetas) < 0.25
         left_mask = (thetas > 0.25) & (thetas < 1.2)
         right_mask = (thetas < -0.25) & (thetas > -1.2)
         
@@ -373,7 +406,7 @@ class Lab3Driver(Node):
         right_dist = min_dist(right_mask)
 
         #detection
-        obstacle_threshold = 0.7 #meters
+        obstacle_threshold = 0.6 #meters
         obstacle_detected = front_dist < obstacle_threshold
 
         #decide consistent turn direction
@@ -421,12 +454,13 @@ class Lab3Driver(Node):
         angle = self.target_angle
         dist = self.target_dist
 
-        min_speed = 0.05
-        max_speed = 0.4
+        # 【你的参数】：完全保留！
+        min_speed = 0.06
+        max_speed = 0.5
         max_turn = np.pi * 0.4
 
         # speed toward target
-        speed = 0.5 * dist
+        speed = 0.9 * dist
         speed = max(min_speed, min(max_speed, speed))
 
         # check obstacles
@@ -445,47 +479,67 @@ class Lab3Driver(Node):
             cmd_v = 0.0
             cmd_w = 0.0
         else:
-            # blocking check
-            blocking_margin = 0.05
-            blocking = obstacle_detected and (front_dist < self.target_dist)
+            # Keep a healthier clearance from walls so the robot doesn't scrape
+            # along them or oscillate when partially inside a wall cell.
+            side_clearance = 0.22
+            hard_side_clearance = 0.16
+            safe_stop = 0.55
+            front_escape = 0.32
 
-            # if blocking and not avoiding, start avoiding
-            if blocking and not self.avoiding:
+            too_close_left = left_dist < side_clearance
+            too_close_right = right_dist < side_clearance
+            trapped_left = left_dist < hard_side_clearance
+            trapped_right = right_dist < hard_side_clearance
+
+            blocking = obstacle_detected and (front_dist < self.target_dist + 0.08)
+
+            # if blocking iand not avoiding, start avoiding
+            if (blocking or too_close_left or too_close_right) and not self.avoiding:
                 self.avoiding = True
                 # choose direction
-                if abs(left_dist - right_dist) < 0.12:
-                # if similar don't go to the obstacle!! pleaseeee
+                if trapped_left and not trapped_right:
+                    self.avoid_dir = -1
+                elif trapped_right and not trapped_left:
+                    self.avoid_dir = 1
+                elif too_close_left and not too_close_right:
+                    self.avoid_dir = -1
+                elif too_close_right and not too_close_left:
+                    self.avoid_dir = 1
+                elif abs(left_dist - right_dist) < 0.12:
                     self.avoid_dir = 1 if (left_dist >= right_dist) else -1
                 else:
                     self.avoid_dir = 1 if (left_dist > right_dist) else -1
 
             # if not blocking and not in avoiding state, normal behavior
             if self.avoiding:
-                # Strategy: Use hysteresis to prevent state oscillation. 
-                # release_clear_dist (0.75) must be greater than safe_stop (0.7).
-                release_clear_dist = 0.75 
+                release_clear_dist = 0.7
 
-                # Strategy: Relaxed side limits (0.35) prevent getting stuck in narrow corridors
-                if front_dist > release_clear_dist and min(left_dist, right_dist) > 0.35:
+                if front_dist > release_clear_dist and min(left_dist, right_dist) > 0.28:
                     self.avoiding = False
                     self.avoid_dir = 0
                 else:
-                    cmd_v = float(self.avoid_speed)
-                    cmd_w = float(max(-max_turn, min(max_turn, self.avoid_turn_bias * self.avoid_dir)))
+                    if front_dist < front_escape or trapped_left or trapped_right:
+                        cmd_v = 0.0
+                    else:
+                        cmd_v = float(self.avoid_speed)
+                    cmd_w = float(max(-max_turn, min(max_turn, 1.1 * self.avoid_turn_bias * self.avoid_dir)))
 
             if not self.avoiding:
-                # safe stop: if something is close stop and turn
-                safe_stop = 0.7  # meters
                 if front_dist < safe_stop:
                     # force avoidance state
                     self.avoiding = True
                     # set avoid_dir if unknown
-                    if self.avoid_dir == 0:
+                    if too_close_left and not too_close_right:
+                        self.avoid_dir = -1
+                    elif too_close_right and not too_close_left:
+                        self.avoid_dir = 1
+                    elif self.avoid_dir == 0:
                         self.avoid_dir = 1 if (left_dist > right_dist) else -1
                     cmd_v = 0.0
                     cmd_w = float(max(-max_turn, min(max_turn, self.avoid_turn_bias * self.avoid_dir)))
                 else:
                     # normal navigation
+                    # angle_gain = 2.5
                     turn = self.angle_gain * angle 
                     cmd_w = float(max(-max_turn, min(max_turn, turn)))
 
@@ -494,8 +548,15 @@ class Lab3Driver(Node):
                     if abs(angle) < angle_threshold_for_foward:
                         cmd_v = float(speed)
                     else:
-                        # Strategy: Stop forward motion and pivot in-place if the goal is behind or far to the side
                         cmd_v = 0.0
+
+                    # If we're skimming a wall, slow down and bias away from it.
+                    if too_close_left or too_close_right:
+                        cmd_v = min(cmd_v, 0.12)
+                        if too_close_left and not too_close_right:
+                            cmd_w = min(cmd_w, -0.45)
+                        elif too_close_right and not too_close_left:
+                            cmd_w = max(cmd_w, 0.45)
 
         final_linear_x = self.alpha * cmd_v + (1 - self.alpha) * self.prev_linear_x
         final_angular_z = self.alpha * cmd_w + (1 - self.alpha) * self.prev_angular_z
@@ -512,7 +573,7 @@ class Lab3Driver(Node):
             self.get_logger().info(f"Setting twist forward {t.twist.linear.x} angle {t.twist.angular.z}")
         
         return t
-
+    
 # The idiom in ROS2 is to use a function to do all of the setup and work.  This
 # function is referenced in the setup.py file as the entry point of the node when
 # we're running the node with ros2 run.  The function should have one argument, for
@@ -540,4 +601,3 @@ if __name__ == '__main__':
     # The idiom in ROS2 is to set up a main() function and to call it from the entry
     # point of the script.
     main()
-
