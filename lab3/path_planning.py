@@ -62,6 +62,8 @@ def is_wall(im, pix=(0, 0)):
     @param im - the image
     @param pix - the pixel i,j
     @return True if pixel value is zero"""
+    if not (0 <= pix[0] < im.shape[1] and 0 <= pix[1] < im.shape[0]):
+        return False
     if im[pix[1], pix[0]] == 0:
         return True
     return False
@@ -72,6 +74,8 @@ def is_unseen(im, pix=(0, 0)):
     @param im - the image
     @param pix - the pixel i,j
     @return True if pixel value 128 (the unseen color value)"""
+    if not (0 <= pix[0] < im.shape[1] and 0 <= pix[1] < im.shape[0]):
+        return False
     if im[pix[1], pix[0]] == 128:
         return True
     return False
@@ -82,6 +86,8 @@ def is_free(im, pix=(0,0)):
     @param im - the image
     @param pix - the pixel i,j
     return True if 255 """
+    if not (0 <= pix[0] < im.shape[1] and 0 <= pix[1] < im.shape[0]):
+        return False
     if im[pix[1], pix[0]] == 255:
         return True
     return False
@@ -147,7 +153,7 @@ def dijkstra(im, robot_loc=(0, 0), goal_loc=(0, 0)):
     if not (0 <= robot_loc[0] < im.shape[1] and 0 <= robot_loc[1] < im.shape[0]):
         raise IndexError(f"ERROR: Robot location {robot_loc} is not in map {im.shape}")
     if not (0 <= goal_loc[0] < im.shape[1] and 0 <= goal_loc[1] < im.shape[0]):
-        raise IndexError(f"ERROR: Goal location {robot_loc} is not in map {im.shape}")
+        raise IndexError(f"ERROR: Goal location {goal_loc} is not in map {im.shape}")
     
     if not is_free(im, robot_loc):
         raise ValueError(f"ERROR: Start location {robot_loc} is not in the free space of the map")
@@ -155,22 +161,33 @@ def dijkstra(im, robot_loc=(0, 0), goal_loc=(0, 0)):
     if not is_free(im, goal_loc):
         raise ValueError(f"ERROR: Goal location {goal_loc} is not in the free space of the map")
  
+    # --- ADDED FOR A*: Heuristic Function ---
+    def heuristic(a, b):
+        return np.sqrt((a[0] - b[0])**2 + (a[1] - b[1])**2)
+
     # The priority queue itself is just a list, with elements of the form (weight, (i,j))
     #    - i.e., a tuple with the first element the weight/score, the second element a tuple with the pixel location
     priority_queue = []
+    
     # Push the start node onto the queue
     #   push takes the queue itself, then a tuple with the first element the priority value and the second
     #   being whatever data you want to keep - in this case, the robot location, which is a tuple
-    heapq.heappush(priority_queue, (0, robot_loc))
+    start_h = heuristic(robot_loc, goal_loc)
+    heapq.heappush(priority_queue, (start_h, robot_loc)) # Changed to push heuristic score
 
     # The power of dictionaries - we're going to use a dictionary to store every node we've visited, along
     #   with the node we came from and the current distance
     # This is easier than trying to get the distance from the heap
     visited = {}
+    
     # Use the (i,j) tuple to index the dictionary
     #   Store the best distance found so far, the parent node, and if it is closed y/n
     # Push the first node onto the heap - distance is zero, it has no parent, and it is NOT closed
     visited[robot_loc] = (0, None, False)   # For every other node this will be the current_node, distance, False
+
+    # --- ADDED FOR A*: Fast closest node tracking ---
+    closest_node = robot_loc
+    min_distance_to_goal = start_h
 
     # While the list is not empty 
     # Use a break statement to end the while loop if you encounter the goal node before the queue empties
@@ -183,7 +200,7 @@ def dijkstra(im, robot_loc=(0, 0), goal_loc=(0, 0)):
 
         # Showing how to get this data back out of visited
         visited_triplet = visited[current_node_ij]  # This is a tuple with three values
-        visited_distance = visited_triplet[0]       # First value is the current distance stored for that node
+        visited_distance = visited_triplet[0]       # First value is the current distance stored for that node (g_score)
         visited_parent = visited_triplet[1]         # Second value is the parent node of this one
         visited_closed_yn = visited_triplet[2]      # Third value is if this node is closed y/n
 
@@ -196,61 +213,55 @@ def dijkstra(im, robot_loc=(0, 0), goal_loc=(0, 0)):
         # YOUR CODE HERE
         if current_node_ij == goal_loc:
             break
+            
+        if not visited_closed_yn:
+            visited[current_node_ij] = (visited_distance, visited_parent, True)
 
-        if visited_closed_yn:
-            continue
+            # --- ADDED FOR A*: Update closest node ---
+            curr_h = heuristic(current_node_ij, goal_loc)
+            if curr_h < min_distance_to_goal:
+                min_distance_to_goal = curr_h
+                closest_node = current_node_ij
 
-        visited[current_node_ij] = (visited_distance, visited_parent, True)
+            for neighor in four_connected(current_node_ij):
+                if (0 <= neighor[0] < im.shape[1] and 0 <= neighor[1] < im.shape[0]) and is_free(im, neighor):
+                    
+                    new_dist = visited_distance + 1 # actual distance traveled (g_score)
 
-        for neighbor in eight_connected(current_node_ij):
-            if not (0 <= neighbor[0] < im.shape[1] and 0 <= neighbor[1] < im.shape[0]):
-                continue
+                    if neighor not in visited:
+                        visited[neighor] = (new_dist, current_node_ij, False)
+                        # Push A* score to queue (g_score + h_score)
+                        f_score = new_dist + heuristic(neighor, goal_loc)
+                        heapq.heappush(priority_queue, (f_score, neighor))
 
-            if not is_free(im, neighbor):
-                continue
+                    else:
+                        old_dist, parent, closed = visited[neighor]
 
-            step_distance = np.sqrt((neighbor[0] - current_node_ij[0])**2 + (neighbor[1] - current_node_ij[1])**2)
-            new_distance = visited_distance + step_distance
+                        if (not closed) and (new_dist < old_dist):
+                            visited[neighor] = (new_dist, current_node_ij, False)
+                            # Push A* score to queue (g_score + h_score)
+                            f_score = new_dist + heuristic(neighor, goal_loc)
+                            heapq.heappush(priority_queue, (f_score, neighor))
 
-            if neighbor not in visited:
-                visited[neighbor] = (new_distance, current_node_ij, False)
-                heapq.heappush(priority_queue, (new_distance, neighbor))
-            else:
-                old_distance, old_parent, old_closed = visited[neighbor]
-                if not old_closed and new_distance < old_distance:
-                    visited[neighbor] = (new_distance, current_node_ij, False)
-                    heapq.heappush(priority_queue, (new_distance, neighbor))
 
     # Now check that we actually found the goal node
-    if not goal_loc in visited:
-        #print(f"Goal {goal_loc} not reached, taking closest");
-
+    if goal_loc not in visited:
         # GUIDE: Deal with not being able to get to the goal loc
         #   If the goal location is not reachable, find the node closest to the goal 
         #.  and return the path to it - you'll want this for the ROS 2 assignment
         # YOUR CODE HERE
-        closest_node = None
-        closest_distance = None
-
-        for node in visited:
-            dist_to_goal = np.sqrt((node[0] - goal_loc[0])**2 + (node[1] - goal_loc[1])**2)
-            if closest_node is None or dist_to_goal < closest_distance:
-                closest_node = node
-                closest_distance = dist_to_goal
-
+        
+        # --- UPGRADED: O(1) closest node fallback (replaces the slow for-loop) ---
         goal_loc = closest_node
 
     path = []
-
+    path.append(goal_loc)
     # GUIDE: Build the path by starting at the goal node and working backwards
     # YOUR CODE HERE
-    current_node = goal_loc
-    while current_node is not None:
-        path.append(current_node)
-        current_node = visited[current_node][1]
-
-    path.reverse();
-
+    current_trace = goal_loc
+    while current_trace is not None:
+        path.insert(0, current_trace)
+        current_trace = visited[current_trace][1]
 
     return path
 
