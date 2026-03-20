@@ -201,8 +201,6 @@ class Lab3Driver(Node):
         # ...and robot stops
         t = self.zero_twist()
         self.cmd_pub.publish(t)
-
-        # reset smoothing memory too
         self.prev_linear_x = 0.0
         self.prev_angular_z = 0.0
                 
@@ -293,8 +291,6 @@ class Lab3Driver(Node):
         # Publish the zero twist
         t = self.zero_twist()
         self.cmd_pub.publish(t)
-
-        # clear smoothing memory at goal completion
         self.prev_linear_x = 0.0
         self.prev_angular_z = 0.0
 
@@ -322,21 +318,17 @@ class Lab3Driver(Node):
             # This applies the transform to the Stamped Point
             #    Note: This does not work, for reasons that are unclear to me
             self.target = do_transform_point(goal, transform)
-            
-            # This does the transform manually, by calculating the theta rotation from the quaternion
+
             euler_ang = -atan2(2 * transform.transform.rotation.z * transform.transform.rotation.w,
                                1.0 - 2 * transform.transform.rotation.z * transform.transform.rotation.z)
-            
-            # Translate to the base link's origin
+
             x = goal.point.x - transform.transform.translation.x
             y = goal.point.y - transform.transform.translation.y
 
-            # Do the rotation
             rot_x = x * cos(euler_ang) - y * sin(euler_ang)
             rot_y = x * sin(euler_ang) + y * cos(euler_ang)
 
-            #target is in robot frame:(rot_x, rot_y)
-            self.target_dist = sqrt(rot_x*rot_x + rot_y*rot_y)
+            self.target_dist = sqrt(rot_x * rot_x + rot_y * rot_y)
             self.target_angle = atan2(rot_y, rot_x)
 
             self.target.point.x = rot_x
@@ -512,7 +504,7 @@ class Lab3Driver(Node):
             if (blocking or too_close_left or too_close_right) and not self.avoiding:
                 self.avoiding = True
                 self.avoid_clear_count = 0
-                # choose direction
+                # Pick one side and stick with it instead of flipping every scan.
                 if trapped_left and not trapped_right:
                     self.avoid_dir = -1
                 elif trapped_right and not trapped_left:
@@ -535,6 +527,7 @@ class Lab3Driver(Node):
                 release_clear_dist = 0.62
 
                 if front_dist > release_clear_dist and min(left_dist, right_dist) > 0.28:
+                    # Require a few clear scans in a row before leaving avoidance mode.
                     self.avoid_clear_count += 1
                     if self.avoid_clear_count >= 4:
                         self.avoiding = False
@@ -626,6 +619,7 @@ class Lab3Driver(Node):
 
         turn_ratio = abs(cmd_w) / max_turn if max_turn > 0 else 0.0
         if turn_ratio > 0.75:
+            # Big turns get a smaller forward speed so the robot does not swing into obstacles.
             cmd_v = min(cmd_v, 0.05)
             if nearest_forward < 0.55 or min(left_dist, right_dist) < 0.26:
                 cmd_v = min(cmd_v, 0.03)
@@ -634,6 +628,7 @@ class Lab3Driver(Node):
 
         rear_tight = min(back_dist, back_left_dist, back_right_dist) < 0.28
         if abs(cmd_w) > 0.45 and rear_tight:
+            # If the robot is rotating with something close behind it, be much more careful.
             if front_dist > 0.45 and nearest_forward > 0.40:
                 cmd_v = max(cmd_v, 0.05)
                 cmd_w = max(-0.45, min(0.45, cmd_w))
