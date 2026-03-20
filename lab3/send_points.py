@@ -157,6 +157,14 @@ class SendPoints(Node):
 	def _goal_done_callback(self, future : Future):
 		""" This gets called when the server says I finished the goal"""
 		result: NavTarget.Result = future.result().result
+		if result.success:
+			self.get_logger().info(f"Got to goal {self.next_goal_index}, moving to next")
+			self.start_timer.reset()  # Increment to the next goal	
+		else:
+			# GUIDE: This is where you should flag if you want to bail on the current set of goals
+			# entirely or just skip to the next one
+			self.get_logger().info(f"Did not get to goal, skipping {self.next_goal_index}")
+
 		self._send_goal_future = None
 		self._result_future = None
 		self._cancel_future = None
@@ -483,9 +491,7 @@ class SendPoints(Node):
 		return None
 
 	def inflate_obstacles(self, im_thresh, inflation_radius=2):
-		"""Create a conservative planning map that keeps the robot away from walls."""
-		# Inflate only confirmed walls. Treating unknown as inflated obstacles makes
-		# doorways and room entrances disappear, which traps the robot in hallways.
+		"""Grow walls a little before planning."""
 		occupied_like = (im_thresh == 0)
 		structure = np.ones((2 * inflation_radius + 1, 2 * inflation_radius + 1), dtype=bool)
 		inflated = ndimage.binary_dilation(occupied_like, structure=structure)
@@ -496,7 +502,7 @@ class SendPoints(Node):
 		return planning_im
 
 	def rank_frontier_candidates(self, im_thresh, possible_points, robot_loc):
-		"""Rank frontier candidates using the same general policy as exploring.py."""
+		"""Try the better frontier points first."""
 		candidates = []
 		for pt in possible_points:
 			for du in range(-1, 2):
@@ -509,30 +515,27 @@ class SendPoints(Node):
 					unseen_neighbors = 0
 					wall_neighbors = 0
 					extended_unseen = 0
-					for nu in range(-2, 3):
-						for nv in range(-2, 3):
+					for nu in range(-1, 2):
+						for nv in range(-1, 2):
 							nbr = (cand[0] + nu, cand[1] + nv)
 							if not (0 <= nbr[0] < im_thresh.shape[1] and 0 <= nbr[1] < im_thresh.shape[0]):
 								continue
 							if im_thresh[nbr[1], nbr[0]] == 255:
-								if abs(nu) <= 1 and abs(nv) <= 1:
-									free_neighbors += 1
+								free_neighbors += 1
 							elif im_thresh[nbr[1], nbr[0]] == 128:
 								extended_unseen += 1
-								if abs(nu) <= 1 and abs(nv) <= 1:
-									unseen_neighbors += 1
+								unseen_neighbors += 1
 							else:
-								if abs(nu) <= 1 and abs(nv) <= 1:
-									wall_neighbors += 1
+								wall_neighbors += 1
 
 					if unseen_neighbors == 0 or free_neighbors < 2:
 						continue
 
 					dist_to_robot = hypot(cand[0] - robot_loc[0], cand[1] - robot_loc[1])
 					score = (
-						3.0 * unseen_neighbors
-						+ 1.4 * extended_unseen
-						+ 0.6 * min(dist_to_robot, 30.0)
+						3.5 * unseen_neighbors
+						+ 0.8 * extended_unseen
+						+ 0.35 * min(dist_to_robot, 25.0)
 						- 2.0 * wall_neighbors
 						+ 0.4 * free_neighbors
 					)
@@ -587,7 +590,6 @@ class SendPoints(Node):
 		if self.completed_all_goals():
 			self.need_new_plan = True
 
-		# Condition 2: Only invalidate a goal if one is actually in flight.
 		goal_in_flight = self._send_goal_future is not None or self._result_future is not None
 		if goal_in_flight and len(self.goal_points) > 0 and self.next_goal_index > 0:
 			active_goal_index = min(self.next_goal_index - 1, len(self.goal_points) - 1)
@@ -662,14 +664,13 @@ class SendPoints(Node):
 		# This puts markers in RViz for all unseen points
 		self._set_reachable_markers(reachable_pts)
 
-		# Always choose a fresh frontier goal when replanning
 		if robot_planning_loc_in_image is None:
 			if robot_planning_loc_raw is None:
 				self.get_logger().info("Could not find a nearby free cell for the robot, waiting for the next map update")
 				self.need_new_plan = True
 				return
 			robot_planning_loc_in_image = robot_planning_loc_raw
-			self.get_logger().info("Falling back to raw-map robot start because the inflated map is too tight")
+			self.get_logger().info("Using the raw map for the robot start")
 
 		candidate_frontiers = self.rank_frontier_candidates(im_thresh, all_unseen_pts, robot_current_loc_in_image)
 		if not candidate_frontiers:
@@ -682,11 +683,11 @@ class SendPoints(Node):
 		selected_planning_im = None
 		selected_path = None
 
-		for goal_loc_in_image in candidate_frontiers[:35]:
+		for goal_loc_in_image in candidate_frontiers[:18]:
 			planning_im = im_plan
-			goal_planning_loc_in_image = self.find_nearest_free_cell(im_plan, goal_loc_in_image, max_radius=7)
+			goal_planning_loc_in_image = self.find_nearest_free_cell(im_plan, goal_loc_in_image, max_radius=6)
 			if goal_planning_loc_in_image is None:
-				goal_planning_loc_in_image = self.find_nearest_free_cell(im_plan_loose, goal_loc_in_image, max_radius=8)
+				goal_planning_loc_in_image = self.find_nearest_free_cell(im_plan_loose, goal_loc_in_image, max_radius=7)
 				if goal_planning_loc_in_image is not None:
 					planning_im = im_plan_loose
 			if goal_planning_loc_in_image is None:
@@ -708,8 +709,8 @@ class SendPoints(Node):
 
 		if selected_goal_loc_in_image is None:
 			raw_start = robot_planning_loc_raw if robot_planning_loc_raw is not None else robot_current_loc_in_image
-			for goal_loc_in_image in candidate_frontiers[:25]:
-				goal_planning_loc_in_image = self.find_nearest_free_cell(im_thresh, goal_loc_in_image, max_radius=14)
+			for goal_loc_in_image in candidate_frontiers[:12]:
+				goal_planning_loc_in_image = self.find_nearest_free_cell(im_thresh, goal_loc_in_image, max_radius=10)
 				if goal_planning_loc_in_image is None:
 					continue
 
@@ -759,25 +760,19 @@ class SendPoints(Node):
 			path_waypoints = find_waypoints(planning_im, path)
 			self.get_logger().info(f"Planned path with {len(path)} cells and {len(path_waypoints)} waypoints")
 
-			# skip only truly degenerate paths
 			if len(path_waypoints) < 2:
 				self.get_logger().info("Path too short, replanning")
 				self.need_new_plan = True
 				return
 					
-			# Keep only a few well-spaced waypoints so the robot commits to moving
-			# through the hallway instead of stopping every few centimeters.
-			sparse_stride = max(4, len(path_waypoints) // 3)
-			sparse_waypoints = path_waypoints[::sparse_stride]
-			if sparse_waypoints[-1] != path_waypoints[-1]:
-				sparse_waypoints.append(path_waypoints[-1])
+			sparse_waypoints = list(path_waypoints)
 
 			raw_path_pts = []
 			for p in sparse_waypoints:
 				map_xy = self.from_image_to_map(map_msg=map_msg, pt_uv=p)
 				raw_path_pts.append(map_xy)
 
-			min_goal_spacing = 0.35
+			min_goal_spacing = 0.45
 			filtered_path_pts = []
 			last_anchor = robot_current_loc_in_map
 			for pt in raw_path_pts:
