@@ -109,6 +109,11 @@ class Lab3Driver(Node):
         self.avoid_turn_bias = 0.7
         self.avoid_speed = 0.04 #small foward motion while avoiding
 
+        self.angle_gain = 2.5   
+        self.prev_linear_x = 0.0  
+        self.prev_angular_z = 0.0 
+        self.alpha = 0.85         
+
         # Timer to make sure we publish the target marker (once we get a goal)
         self.marker_timer = self.create_timer(1.0, self._marker_callback)
 
@@ -392,7 +397,13 @@ class Lab3Driver(Node):
         @param scan - a LaserScan message with the current data from the LiDAR.  Use this for obstacle avoidance. 
             This is the same as your lab1 go and stop code
         @return a twist command"""
-        print(f"Target: {self.target}, Target_dist: {self.target_dist}")
+        
+        # Strategy: We implement a State Machine for obstacle avoidance to prevent "corner trapping".
+        # When an obstacle breaches the safety margin, the robot enters the 'avoiding' state, 
+        # picks the most open direction (left or right), and commits to that turn until the front 
+        # is completely clear. Finally, we apply a low-pass filter (alpha = 0.85) to all output 
+        # twist commands to guarantee smooth physical movement and prevent mechanical jitter.
+        
         t = self.zero_twist()
 
         # GUIDE:
@@ -414,31 +425,31 @@ class Lab3Driver(Node):
         max_speed = 0.4
         max_turn = np.pi * 0.4
 
-        #speed toward target
+        # speed toward target
         speed = 0.5 * dist
         speed = max(min_speed, min(max_speed, speed))
 
-        #check obstacles
+        # check obstacles
         obstacle_detected, obs_speed, obs_turn_raw, front_dist, left_dist, right_dist = self.get_obstacle(scan)
 
-        #obs_turn isn't larger than max_turn
+        # obs_turn isn't larger than max_turn
         obs_turn = float(max(-max_turn, min(max_turn, obs_turn_raw)))
 
         cmd_v = 0.0
         cmd_w = 0.0
 
-        #if we're getting close enough, stop
+        # if we're getting close enough, stop
         if self.close_enough():
             self.avoiding = False
             self.avoid_dir = 0
             cmd_v = 0.0
             cmd_w = 0.0
         else:
-            #blocking check
+            # blocking check
             blocking_margin = 0.05
             blocking = obstacle_detected and (front_dist < self.target_dist)
 
-            #if blocking iand not avoiding, start avoiding
+            # if blocking and not avoiding, start avoiding
             if blocking and not self.avoiding:
                 self.avoiding = True
                 # choose direction
@@ -448,10 +459,14 @@ class Lab3Driver(Node):
                 else:
                     self.avoid_dir = 1 if (left_dist > right_dist) else -1
 
-            #if not blocking and not in avoiding state, normal behavior
+            # if not blocking and not in avoiding state, normal behavior
             if self.avoiding:
-                release_clear_dist = 0.6
-                if front_dist > release_clear_dist and min(left_dist, right_dist) > 0.55:
+                # Strategy: Use hysteresis to prevent state oscillation. 
+                # release_clear_dist (0.75) must be greater than safe_stop (0.7).
+                release_clear_dist = 0.75 
+
+                # Strategy: Relaxed side limits (0.35) prevent getting stuck in narrow corridors
+                if front_dist > release_clear_dist and min(left_dist, right_dist) > 0.35:
                     self.avoiding = False
                     self.avoid_dir = 0
                 else:
@@ -459,7 +474,7 @@ class Lab3Driver(Node):
                     cmd_w = float(max(-max_turn, min(max_turn, self.avoid_turn_bias * self.avoid_dir)))
 
             if not self.avoiding:
-                #safe stop: if something is close stop and turn
+                # safe stop: if something is close stop and turn
                 safe_stop = 0.7  # meters
                 if front_dist < safe_stop:
                     # force avoidance state
@@ -470,16 +485,17 @@ class Lab3Driver(Node):
                     cmd_v = 0.0
                     cmd_w = float(max(-max_turn, min(max_turn, self.avoid_turn_bias * self.avoid_dir)))
                 else:
-                    #normal navigation
-                    turn = max(-max_turn, min(max_turn, angle))
-                    cmd_w = float(turn)
+                    # normal navigation
+                    turn = self.angle_gain * angle 
+                    cmd_w = float(max(-max_turn, min(max_turn, turn)))
 
-                    #allow forward motion if target is in front
-                    angle_threshold_for_foward = 1.0 #radians
+                    # allow forward motion if target is in front
+                    angle_threshold_for_foward = 0.8 
                     if abs(angle) < angle_threshold_for_foward:
                         cmd_v = float(speed)
                     else:
-                        cmd_v = 0.05
+                        # Strategy: Stop forward motion and pivot in-place if the goal is behind or far to the side
+                        cmd_v = 0.0
 
         final_linear_x = self.alpha * cmd_v + (1 - self.alpha) * self.prev_linear_x
         final_angular_z = self.alpha * cmd_w + (1 - self.alpha) * self.prev_angular_z
@@ -495,8 +511,7 @@ class Lab3Driver(Node):
         if self.print_twist_messages:
             self.get_logger().info(f"Setting twist forward {t.twist.linear.x} angle {t.twist.angular.z}")
         
-        return t 
-
+        return t
 
 # The idiom in ROS2 is to use a function to do all of the setup and work.  This
 # function is referenced in the setup.py file as the entry point of the node when
