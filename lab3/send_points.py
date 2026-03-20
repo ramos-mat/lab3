@@ -59,6 +59,8 @@ class SendPoints(Node):
 		self.completed_frontiers = []
 		self.failed_frontiers = []
 		self.last_feedback_log_distance = None
+		self.last_plan_time_ns = 0
+		self.replan_cooldown_ns = 3_000_000_000
 
 		# Parameters that hold the current state of the action client
 		#   You don't need to mess with these
@@ -260,6 +262,8 @@ class SendPoints(Node):
 		if skip_current:
 			self.skip_current_goal()
 
+		# Remember when this plan was created so we can avoid replanning again immediately.
+		self.last_plan_time_ns = self.get_clock().now().nanoseconds
 		self._set_goal_markers()
 		# This will kick start sending more goal points if it's stopped sending
 		if self._result_future == None:
@@ -563,11 +567,9 @@ class SendPoints(Node):
 		im = im.reshape((map_msg.info.height, map_msg.info.width))
 
 		im_thresh = np.zeros(im.shape, dtype=np.uint8)
-
-		# Threshold image
-		im_thresh[im < 10] = 255    # Free
-		im_thresh[im >= 100] = 0    # Wall
-		im_thresh[im == -1] = 128   # Unknown
+		im_thresh[im < 10] = 255
+		im_thresh[im >= 100] = 0
+		im_thresh[im == -1] = 128
 		im_plan = self.inflate_obstacles(im_thresh, inflation_radius=2)
 		im_plan_loose = self.inflate_obstacles(im_thresh, inflation_radius=1)
 
@@ -601,21 +603,25 @@ class SendPoints(Node):
 				0 <= current_active_goal_uv[1] < im_thresh.shape[0]
 			)
 
-			goal_still_reachable = False
+			goal_ok = False
 			if not is_out_of_bounds:
 				if is_free(im_thresh, current_active_goal_uv):
-					goal_still_reachable = True
+					goal_ok = True
 				elif self.find_nearest_free_cell(im_plan_loose, current_active_goal_uv, max_radius=3) is not None:
-					goal_still_reachable = True
+					goal_ok = True
 				elif self.find_nearest_free_cell(im_thresh, current_active_goal_uv, max_radius=4) is not None:
-					goal_still_reachable = True
+					goal_ok = True
 
-			if is_out_of_bounds or not goal_still_reachable:
+			if is_out_of_bounds or not goal_ok:
 				self.get_logger().info("Current goal is off map or no longer free! Replanning...")
 				self.need_new_plan = True
 
 		if not self.need_new_plan:
 			return 
+
+		now_ns = self.get_clock().now().nanoseconds
+		if self.last_plan_time_ns != 0 and (now_ns - self.last_plan_time_ns) < self.replan_cooldown_ns:
+			return
 			
 		# GUIDE: Change this to get just the points you might consider looking at and perhaps don't do it every time a map is made
 		all_unseen_pts = find_all_possible_goals(im_thresh)  # Your exploring code
@@ -633,12 +639,12 @@ class SendPoints(Node):
 			map_xy = self.from_image_to_map(map_msg=map_msg, pt_uv=p)
 			if (
 				not any(
-				hypot(map_xy[0] - frontier[0], map_xy[1] - frontier[1]) < completed_frontier_radius
-				for frontier in self.completed_frontiers
+					hypot(map_xy[0] - frontier[0], map_xy[1] - frontier[1]) < completed_frontier_radius
+					for frontier in self.completed_frontiers
 				)
 				and not any(
-				hypot(map_xy[0] - frontier[0], map_xy[1] - frontier[1]) < failed_frontier_radius
-				for frontier in self.failed_frontiers
+					hypot(map_xy[0] - frontier[0], map_xy[1] - frontier[1]) < failed_frontier_radius
+					for frontier in self.failed_frontiers
 				)
 			):
 				unvisited_unseen_pts.append(p)
@@ -816,7 +822,7 @@ def main(args=None):
 	rclpy.init(args=args)
 
 	# Create a list of points that will take the robot through the map
-	points = []
+	points = [(-4.5, -3.0), (-4.5, 0.0), (-1.0, 0.0)]
 	send_points = SendPoints(points)
 
 	# Multi-threaded execution
