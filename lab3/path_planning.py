@@ -142,6 +142,7 @@ def eight_connected(pix=(0, 0)):
             yield ret
 
 
+# -------------- Planning on the map ---------------
 def dijkstra(im, robot_loc=(0, 0), goal_loc=(0, 0)):
     """ Occupancy grid image, with robot and goal loc as pixels
     @param im - the thresholded image - use is_free(i, j) to determine if in reachable node
@@ -167,7 +168,6 @@ def dijkstra(im, robot_loc=(0, 0), goal_loc=(0, 0)):
     # The priority queue itself is just a list, with elements of the form (weight, (i,j))
     #    - i.e., a tuple with the first element the weight/score, the second element a tuple with the pixel location
     priority_queue = []
-    
     # Push the start node onto the queue
     #   push takes the queue itself, then a tuple with the first element the priority value and the second
     #   being whatever data you want to keep - in this case, the robot location, which is a tuple
@@ -178,12 +178,12 @@ def dijkstra(im, robot_loc=(0, 0), goal_loc=(0, 0)):
     #   with the node we came from and the current distance
     # This is easier than trying to get the distance from the heap
     visited = {}
-    
     # Use the (i,j) tuple to index the dictionary
     #   Store the best distance found so far, the parent node, and if it is closed y/n
     # Push the first node onto the heap - distance is zero, it has no parent, and it is NOT closed
     visited[robot_loc] = (0, None, False)   # For every other node this will be the current_node, distance, False
 
+    # Keep track of the closest node we have seen so we still return a useful path if the goal is blocked.
     closest_node = robot_loc
     min_distance_to_goal = start_h
 
@@ -197,10 +197,10 @@ def dijkstra(im, robot_loc=(0, 0), goal_loc=(0, 0)):
         current_node_ij = current_node[1]  # i,j index of current node
 
         # Showing how to get this data back out of visited
-        visited_triplet = visited[current_node_ij]
-        visited_distance = visited_triplet[0]
-        visited_parent = visited_triplet[1]
-        visited_closed_yn = visited_triplet[2]
+        visited_triplet = visited[current_node_ij]  # This is a tuple with three values
+        visited_distance = visited_triplet[0]       # First value is the current distance stored for that node
+        visited_parent = visited_triplet[1]         # Second value is the parent node of this one
+        visited_closed_yn = visited_triplet[2]      # Third value is if this node is closed y/n
 
         # GUIDE
         #  Step 1: Break out of the loop if current_node_ij is the goal node
@@ -227,6 +227,7 @@ def dijkstra(im, robot_loc=(0, 0), goal_loc=(0, 0)):
 
                     if neighor not in visited:
                         visited[neighor] = (new_dist, current_node_ij, False)
+                        # Priority uses the path cost so far plus the heuristic to the goal.
                         f_score = new_dist + heuristic(neighor, goal_loc)
                         heapq.heappush(priority_queue, (f_score, neighor))
 
@@ -240,12 +241,13 @@ def dijkstra(im, robot_loc=(0, 0), goal_loc=(0, 0)):
 
 
     # Now check that we actually found the goal node
-    if goal_loc not in visited:
+    if not goal_loc in visited:
+        print(f"Goal {goal_loc} not reached, taking closest")
+
         # GUIDE: Deal with not being able to get to the goal loc
         #   If the goal location is not reachable, find the node closest to the goal 
         #.  and return the path to it - you'll want this for the ROS 2 assignment
         # YOUR CODE HERE
-        
         goal_loc = closest_node
 
     path = []
@@ -260,6 +262,7 @@ def dijkstra(im, robot_loc=(0, 0), goal_loc=(0, 0)):
     return path
 
 
+# -------------- Helpers for opening and checking maps ---------------
 def open_image(im_name):
     """ A helper function to open up the image and the yaml file and threshold
     @param im_name - name of image in Data directory
