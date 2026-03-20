@@ -588,6 +588,7 @@ class SendPoints(Node):
 		if robot_planning_loc_in_image is not None and robot_planning_loc_in_image != robot_current_loc_in_image:
 			self.get_logger().info(f"Snapped robot planning cell from {robot_current_loc_in_image} to {robot_planning_loc_in_image}")
 
+		# DOC: WHEN TO GET NEW WAYPOINTS - Trigger #1: Goal list completed
 		# Condition 1: We finished our current list of goals
 		if self.completed_all_goals():
 			self.need_new_plan = True
@@ -612,6 +613,7 @@ class SendPoints(Node):
 				elif self.find_nearest_free_cell(im_thresh, current_active_goal_uv, max_radius=4) is not None:
 					goal_ok = True
 
+			# DOC: WHEN TO GET NEW WAYPOINTS - Trigger #2: Current goal out-of-bounds or unreachable (SLAM origin shift)
 			if is_out_of_bounds or not goal_ok:
 				self.get_logger().info("Current goal is off map or no longer free! Replanning...")
 				self.need_new_plan = True
@@ -623,7 +625,7 @@ class SendPoints(Node):
 		if self.last_plan_time_ns != 0 and (now_ns - self.last_plan_time_ns) < self.replan_cooldown_ns:
 			return
 			
-		# GUIDE: Change this to get just the points you might consider looking at and perhaps don't do it every time a map is made
+		# DOC: WHEN TO GET NEW WAYPOINTS - Triggered by: goal list exhausted, goal out-of-bounds, or goal unreachable
 		all_unseen_pts = find_all_possible_goals(im_thresh)  # Your exploring code
 
 		# Filter out points that are outside the current image bounds
@@ -763,6 +765,7 @@ class SendPoints(Node):
 			return
 		try:
 			path = selected_path if selected_path is not None else dijkstra(planning_im, robot_planning_loc_in_image, goal_planning_loc_in_image)
+			# DOC: WAYPOINT PIPELINE - Dijkstra path planning → find_waypoints() subsample (corners + periodic spacing)
 			path_waypoints = find_waypoints(planning_im, path)
 			self.get_logger().info(f"Planned path with {len(path)} cells and {len(path_waypoints)} waypoints")
 

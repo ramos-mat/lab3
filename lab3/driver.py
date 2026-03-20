@@ -210,7 +210,8 @@ class Lab3Driver(Node):
         return CancelResponse.ACCEPT
     
     def close_enough(self):
-        """ Return true if close enough to goal. This will be used in action_callback to stop moving toward the goal
+        """ DOC: When robot is close enough to goal (stops movement)
+        Uses threshold distance (typically 0.1m) after TF transform in set_target()
         @ return true/false """
         if self.target_dist is None:
             return False
@@ -244,7 +245,7 @@ class Lab3Driver(Node):
         self.set_target()
 
         # Keep publishing feedback, then sleeping (so the laser scan can happen)
-        # GUIDE: If you aren't making progress, stop the while loop and mark the goal as failed
+        # DOC: STOPPING CRITERIA - Goal fails if no progress for >12 loops (distance improves by <0.05m)
         best_dist = self.target_dist if self.target_dist is not None else 1e9
         no_progress_loops = 0
         rate = self.create_rate(2.0)
@@ -433,9 +434,10 @@ class Lab3Driver(Node):
         return obstacle_detected, obs_speed, obs_turn, front_dist, left_dist, right_dist, front_left_dist, front_right_dist, back_dist, back_left_dist, back_right_dist
 
     def get_twist(self, scan):
-        """This is the method that calculate the twist
-        @param scan - a LaserScan message with the current data from the LiDAR.  Use this for obstacle avoidance. 
-            This is the same as your lab1 go and stop code
+        """DOC: TWIST GENERATION / OBSTACLE AVOIDANCE STRATEGY
+        Combines target-tracking (angle/distance) with obstacle avoidance (LiDAR-based turn bias)
+        Hysteresis blocking (0.5m on, 0.68m off) + goal-biased steering blends both behaviors
+        @param scan - a LaserScan message with the current data from the LiDAR
         @return a twist command"""
         
         t = self.zero_twist()
@@ -463,7 +465,7 @@ class Lab3Driver(Node):
         speed = 0.9 * dist
         speed = max(min_speed, min(max_speed, speed))
 
-        # check obstacles
+        # DOC: OBSTACLE AVOIDANCE - Query LiDAR for front/left/right distances (0.5m threshold)
         obstacle_detected, obs_speed, obs_turn_raw, front_dist, left_dist, right_dist, front_left_dist, front_right_dist, back_dist, back_left_dist, back_right_dist = self.get_obstacle(scan)
 
         # obs_turn isn't larger than max_turn
@@ -473,7 +475,7 @@ class Lab3Driver(Node):
         cmd_w = 0.0
         nearest_forward = min(front_dist, front_left_dist, front_right_dist)
 
-        # if we're getting close enough, stop
+        # DOC: STOPPING CHECK - If close_enough(), exit obstacle avoidance and stop
         if self.close_enough():
             self.avoiding = False
             self.avoid_dir = 0
